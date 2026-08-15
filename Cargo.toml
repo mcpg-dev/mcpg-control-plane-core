@@ -1,0 +1,100 @@
+[package]
+name = "mcpg-control-plane-core"
+version = "0.1.0-beta.13"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared types, traits, and protocol definitions for the MCPG Control Plane."
+
+[lib]
+
+[features]
+default = ["sqlite"]
+# DB engine selection. Server picks one (or both, runtime-dispatched).
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+# Reduced footprint for Tier 0 builds — disables postgres + RLS.
+tier0 = ["sqlite"]
+tier1 = ["postgres", "sqlite"]
+tier2 = ["postgres"]
+# At-rest secrets via an external KMS (HashiCorp Vault Transit). Off by
+# default — self-host / dev use `LocalCipher` or `NoopCipher`. Pulls reqwest.
+kms = ["dep:reqwest"]
+
+[dependencies]
+mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+sha2 = "0.10"
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Envelope encryption (at-rest secrets: license payloads, cluster creds)
+aes-gcm = "0.10"
+
+# Errors + tracing
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+# Serde + JSON / YAML / TOML
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# Published gateway configs arrive as YAML or TOML; the publish guard
+# parses both to verify the cloud auth posture (require_cloud_auth).
+toml = "0.8"
+
+# Time + UUIDs
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+# Crypto: Ed25519 (license + audit signing)
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand = "0.8"
+hex = "0.4"
+blake3 = "1"
+base64 = "0.22"
+
+# JWT (license tokens)
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
+
+# Direct rustls dep so we can install a process-default CryptoProvider
+# at boot. Required because jsonwebtoken 10.x with `aws_lc_rs` pulls
+# aws-lc-rs into the dep graph alongside ring (which sqlx / reqwest /
+# kube / tonic transitively pull). rustls 0.23 refuses to auto-pick
+# a provider when both features are enabled. See `tls_init` module.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+
+# DB
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "macros", "chrono", "uuid", "json", "migrate"] }
+
+# gRPC types (compiled from proto/)
+prost = "0.13"
+prost-types = "0.13"
+
+# KMS backend (feature `kms`): HTTP client for Vault Transit. Optional so the
+# default cp-core build (and every binary that doesn't opt into a KMS) stays
+# reqwest-free. rustls-tls keeps the single-provider posture (see tls_init).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "channel", "server"] }
+
+# Networking
+url = { version = "2", features = ["serde"] }
+
+# Glob (for plugin entitlement matching)
+globset = "0.4"
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = ["prost", "transport"] }
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+proptest = "1"
+# Postgres + RLS test pulls a Postgres-flavoured sqlx through
+# the `postgres` feature. Skipped at runtime unless
+# MCPG_POSTGRES_TEST_URL is set.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "uuid"] }
+uuid = { version = "1", features = ["v4"] }
+# Stubs Vault Transit for the `kms` cipher test.
+wiremock = "0.6"

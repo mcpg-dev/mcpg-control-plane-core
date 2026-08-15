@@ -1,0 +1,490 @@
+// MCPG Control Plane — Agent gRPC contract v1.
+//
+// STABILITY: this package (`mcpg.cp.v1`) is a public stability
+// commitment. Once any tier-1 customer uses it, breaking changes
+// must go to `mcpg.cp.v2` with a deprecation window.
+//
+//   * adding messages, fields, RPCs       -> backward compatible
+//   * removing fields or reusing tags     -> NEVER (use `reserved`)
+//   * changing semantics                  -> v2 bump
+
+syntax = "proto3";
+package mcpg.cp.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/empty.proto";
+
+// Server API every gateway / BYOC agent calls. Uses mTLS + per-
+// instance JWT for authentication.
+service AgentControl {
+  // One-shot enrollment exchange. Caller presents a bootstrap
+  // token, receives mTLS cert + instance JWT + initial config.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Long-lived bidirectional stream. After Register, the gateway
+  // opens this stream to receive config updates / commands and
+  // to send heartbeats / status / acks.
+  rpc Channel(stream AgentMessage) returns (stream ServerMessage);
+
+  // Unary fallback: pull current config on demand. Used when
+  // streaming is unstable (corporate proxies, ephemeral
+  // containers).
+  rpc PullConfig(PullConfigRequest) returns (PullConfigResponse);
+
+  // Heartbeat-only fallback when streaming can't be maintained.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Graceful deregister.
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+}
+
+// ─────────────── Enrollment ───────────────
+
+message RegisterRequest {
+  // Bootstrap token from the enrollment URL.
+  string bootstrap_token = 1;
+  // Stable, gateway-generated id. Persists across restarts.
+  string instance_uid = 2;
+  string version = 3;
+  map<string, string> labels = 4;
+  // Capabilities the instance has at start (loaded plugin
+  // classes, hardware features, etc.).
+  repeated string capabilities = 5;
+  // Endpoints this instance accepts traffic on (surface in CP
+  // UI for operators).
+  repeated AddressableEndpoint addressable_endpoints = 6;
+  // Optional metadata about the host (OS, arch, runtime).
+  HostInfo host = 7;
+}
+
+message HostInfo {
+  string os = 1;
+  string arch = 2;
+  string hostname = 3;
+  string kernel_version = 4;
+}
+
+message RegisterResponse {
+  // PEM-encoded client cert + key for mTLS on subsequent calls.
+  string client_cert_pem = 1;
+  string client_key_pem = 2;
+  string ca_chain_pem = 3;
+  // Short-lived JWT bound to the instance.
+  string instance_jwt = 4;
+  string cp_endpoint = 5;
+  string instance_id = 6;
+  // Initial config bundle so the gateway can boot immediately.
+  ConfigBundle initial_config = 7;
+  // Instance should rotate credentials before this time.
+  google.protobuf.Timestamp credentials_refresh_at = 8;
+  // E.4 — per-tenant Data Encryption Key the gateway uses to
+  // encrypt request/response payloads before shipping them in
+  // `ToolInvocationSample.{request,response}_payload`. 32 raw
+  // bytes (AES-256). When empty, the CP isn't issuing a DEK
+  // (older CP / unmetered tier / `payload_capture` license
+  // feature absent) — the gateway falls back to plaintext
+  // capture, and the CP wraps at ingest with `EnvelopeCipher`
+  // as before. When non-empty, the gateway encrypts source-
+  // side and the CP stores the ciphertext as-is.
+  bytes payload_dek = 9;
+  // Version of the issued `payload_dek`. Echoed on each
+  // `ToolInvocationSample` the gateway sends so the CP knows
+  // which DEK row to fetch when decrypting.
+  uint32 payload_dek_version = 10;
+}
+
+message AddressableEndpoint {
+  // e.g. "http", "grpc-mcp", "http-mgmt"
+  string scheme = 1;
+  string host = 2;
+  uint32 port = 3;
+  string path_prefix = 4;
+}
+
+// ─────────────── Streaming channel ───────────────
+
+message AgentMessage {
+  oneof kind {
+    Heartbeat heartbeat = 1;
+    StatusReport status_report = 2;
+    CommandResult command_result = 3;
+    LogChunk log_chunk = 4;
+    DiagnosticResult diagnostic_result = 5;
+    ConfigAck config_ack = 6;
+    // Per-call tool invocation samples batched every 30-60s.
+    // Independent cadence from StatusReport so metrics are not
+    // coupled to plugin-state polling.
+    MetricsReport metrics_report = 7;
+    // Unsolicited periodic batch of recent gateway log lines (like
+    // MetricsReport), powering `mcpg cloud logs`. Distinct from the
+    // command-driven LogRequest→LogChunk pairing (field 4/6).
+    LogBatch log_batch = 8;
+  }
+}
+
+message ServerMessage {
+  oneof kind {
+    ConfigUpdate config_update = 1;
+    Command command = 2;
+    CredentialRotation credential_rotation = 3;
+    Quarantine quarantine = 4;
+    DiagnosticRequest diagnostic_request = 5;
+    LogRequest log_request = 6;
+    // E.3 — fast-path quota status push. Sent on threshold cross
+    // ("approaching exhaustion") + on rolling-window replenishment.
+    // Heartbeat responses also carry the same value as a baseline
+    // so a gateway that misses a push converges within ~30s.
+    QuotaStatus quota_status = 7;
+  }
+}
+
+// CP→gateway license-quota status. Tracks `tool_calls_per_month`
+// (rolling 30 days) on the org's license. Gateway uses this to
+// pre-dispatch refuse calls when exhausted, avoiding wasted
+// upstream tool execution. Pushed both as a `ServerMessage` fast
+// path (on threshold cross / replenishment) and as an optional
+// field on every `HeartbeatResponse` (baseline self-heal).
+message QuotaStatus {
+  // True when the org has consumed `tool_calls_per_month` and
+  // further dispatches must be refused gateway-side.
+  bool exhausted = 1;
+  // Best-effort rolling-window replenishment hint. Gateways MAY
+  // set HTTP `Retry-After` from this. May be unset when CP can't
+  // estimate (e.g. unmetered/unlimited tier).
+  google.protobuf.Timestamp until = 2;
+  // Calls remaining in the current window. Zero on `exhausted:
+  // true`. Unset when the license is unlimited.
+  optional uint64 remaining = 3;
+  // Window cap (the license `tool_calls_per_month`). Unset when
+  // unlimited. Operator UI uses this for the "X / Y used" bar.
+  optional uint64 limit = 4;
+
+  // Per-gateway requests-per-second ceiling from the license
+  // (`rps_per_gateway`). A SAFEGUARD against runaway usage, not a
+  // billing meter: the gateway sheds load above it rather than
+  // letting a loop burn a month's allowance in minutes. Unset when
+  // the license does not cap it.
+  optional uint32 rps_limit = 5;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp at = 1;
+  uint64 seq = 2;
+  // Brief health summary; full StatusReport on demand.
+  string health = 3; // "ok" | "degraded" | "down"
+  uint64 active_connections = 4;
+  double cpu_load_avg = 5;
+  uint64 memory_rss_bytes = 6;
+}
+
+message StatusReport {
+  google.protobuf.Timestamp at = 1;
+  string config_hash = 2; // hash of currently-applied config
+  repeated PluginStatus plugins = 3;
+  ResourceUsage resources = 4;
+  repeated string warnings = 5;
+}
+
+message PluginStatus {
+  string id = 1; // e.g. dev.mcpg.identity.workload
+  string version = 2;
+  string state = 3; // "loaded" | "failed" | "unloading"
+  string error = 4;
+  uint64 invocations = 5;
+}
+
+message ResourceUsage {
+  double cpu_percent = 1;
+  uint64 memory_rss_bytes = 2;
+  uint64 disk_used_bytes = 3;
+  uint32 open_file_descriptors = 4;
+  uint64 connections_open = 5;
+}
+
+message ConfigUpdate {
+  string config_hash = 1;
+  ConfigBundle bundle = 2;
+  // Optional: a delta from the prior hash, for efficient
+  // updates. Bundle is authoritative.
+  ConfigDelta delta = 3;
+  ApplyMode mode = 4;
+}
+
+enum ApplyMode {
+  APPLY_MODE_UNSPECIFIED = 0;
+  HOT_RELOAD = 1;          // reload plugins in place
+  GRACEFUL_RESTART = 2;    // drain + restart
+  IMMEDIATE_RESTART = 3;   // drop in-flight requests; restart
+}
+
+message ConfigBundle {
+  // Versioned config envelope.
+  uint32 schema_version = 1;
+  // Serialised gateway boot config (TOML).
+  bytes config_toml = 2;
+  PluginSet plugin_set = 3;
+  RevocationList revocation_list = 4;
+  // License JWT — gateway verifies independently.
+  string license_jwt = 5;
+}
+
+message PluginSet {
+  string id = 1;
+  string content_hash = 2;
+  repeated PluginEntry entries = 3;
+  map<string, RepeatedString> capability_grants = 4;
+}
+
+message PluginEntry {
+  string id = 1;
+  string oci_ref = 2;
+  string digest = 3; // sha256:...
+  bool enabled = 4;
+  bool enforce = 5;
+  google.protobuf.Struct config = 6;
+}
+
+message RepeatedString { repeated string values = 1; }
+
+message RevocationList {
+  string content_hash = 1;
+  repeated RevocationEntry entries = 2;
+}
+
+message RevocationEntry {
+  string artifact_sha256 = 1;
+  string reason = 2;
+  google.protobuf.Timestamp revoked_at = 3;
+}
+
+message ConfigDelta {
+  // Implementation detail; bundle is authoritative.
+  bytes ops = 1;
+}
+
+message ConfigAck {
+  string config_hash = 1;
+  google.protobuf.Timestamp applied_at = 2;
+  string applied_state = 3; // "active" | "failed"
+  string error = 4;
+}
+
+// Per-call tool invocation samples batched by the gateway and
+// shipped to the CP for storage + rollup. Cadence:
+// every 30-60s, capped at ~500 samples per message to bound
+// wire size; a bounded ring buffer on the gateway drops oldest
+// when the cap is hit (overflow counted in `dropped_overflow`).
+//
+// Privacy invariant: tool *names* and aggregate stats only.
+// Tool *arguments* and *responses* are NEVER shipped — they may
+// contain PII / secrets. Error messages travel as a BLAKE3 hash;
+// operators correlate via local gateway logs.
+message MetricsReport {
+  google.protobuf.Timestamp at = 1;
+  uint64 seq = 2;
+  repeated ToolInvocationSample invocations = 3;
+  // Number of samples dropped at the source because the gateway's
+  // in-memory ring buffer overflowed. Surfaces "we ran hot" to
+  // the operator without distorting the stored time-series.
+  uint64 dropped_overflow = 4;
+}
+
+message ToolInvocationSample {
+  string plugin_id = 1;             // e.g. "github"
+  string tool_name = 2;              // e.g. "list_repos"
+  string binding_id = 3;             // empty when not routed via a binding
+  google.protobuf.Timestamp started_at = 4;
+  uint32 duration_ms = 5;
+  ToolOutcome outcome = 6;
+  string error_code = 7;             // empty when outcome=OK
+  string error_hash = 8;             // blake3 hex; empty when outcome=OK
+  string request_id = 9;             // correlation id (audit / tracing)
+  string caller_subject = 10;        // "user:alice@acme" / "service:foo"
+  // OPTIONAL payload capture (Enterprise opt-in).
+  // Empty unless the gateway is built with `cp-attached`, the
+  // operator sets `control_plane.capture_payloads: true`, AND
+  // the active license carries the `payload_capture` feature
+  // flag. Privacy: payloads MAY contain PII / secrets.
+  //
+  // Encryption: when the CP issued a `payload_dek` at Register,
+  // these bytes are AES-256-GCM ciphertext (12-byte nonce
+  // prefix) — see `payload_encrypted` below. Otherwise, they
+  // are plaintext and the CP wraps them at ingest with the
+  // per-tenant `EnvelopeCipher` (CP holds plaintext
+  // transiently). The wire is TLS-protected either way.
+  bytes request_payload = 11;
+  bytes response_payload = 12;
+  // E.4 — when true, `request_payload` / `response_payload`
+  // are AES-256-GCM ciphertext encrypted by the gateway with
+  // its tenant DEK. The CP stores the ciphertext as-is (no
+  // re-wrap with `EnvelopeCipher`); operators reading the row
+  // unwrap with the matching `tenant_payload_keys` row.
+  bool payload_encrypted = 13;
+  // Version of the DEK used to encrypt this sample's payloads.
+  // Echoes `RegisterResponse.payload_dek_version`. Zero +
+  // `payload_encrypted: false` is the legacy plaintext path.
+  uint32 dek_version = 14;
+}
+
+// Unsolicited periodic batch of recent gateway log lines, shipped on its own
+// cadence (like MetricsReport). Field-for-field parallel to MetricsReport so
+// the seq/dropped/skip-empty semantics carry over. PRIVACY: unlike
+// MetricsReport (names + hashes only), a LogLine carries the rendered log
+// message verbatim, which MAY contain secrets/PII — it is the tenant's OWN
+// gateway logs surfaced back to the tenant (the same data `kubectl logs` shows).
+message LogBatch {
+  google.protobuf.Timestamp at = 1;
+  uint64 seq = 2;
+  repeated LogLine lines = 3;
+  // Lines dropped at the source because the gateway's in-memory ring
+  // overflowed (surfaces "we ran hot" without distorting the stream).
+  uint64 dropped_overflow = 4;
+}
+
+message LogLine {
+  google.protobuf.Timestamp at = 1;
+  LogLevel level = 2;
+  string target = 3;       // tracing target / module path
+  string message = 4;      // rendered message (v1: no structured fields)
+  string plugin_id = 5;    // empty when not attributable to a plugin
+}
+
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_LEVEL_TRACE = 1;
+  LOG_LEVEL_DEBUG = 2;
+  LOG_LEVEL_INFO = 3;
+  LOG_LEVEL_WARN = 4;
+  LOG_LEVEL_ERROR = 5;
+}
+
+enum ToolOutcome {
+  TOOL_OUTCOME_UNSPECIFIED = 0;
+  TOOL_OUTCOME_OK = 1;
+  TOOL_OUTCOME_CLIENT_ERROR = 2;
+  TOOL_OUTCOME_SERVER_ERROR = 3;
+  TOOL_OUTCOME_POLICY_DENIED = 4;
+  // E.3 — gateway pre-dispatch refusal because CP-pushed quota
+  // status said exhausted. Distinct from CLIENT_ERROR (caller
+  // blame) and POLICY_DENIED (operator policy chain).
+  TOOL_OUTCOME_QUOTA_EXCEEDED = 5;
+  // `dev.mcpg/idempotency` cache hit: the gateway replayed a
+  // previously-cached terminal envelope instead of running a new
+  // dispatch. The caller got a successful response, but NO new
+  // execution happened — so the CP MUST exclude this outcome from
+  // both the billing rollup (`tool_usage_rollups_*.calls`) and the
+  // `tool_calls_per_month` quota math. Distinct from OK (which is a
+  // real, billable execution).
+  TOOL_OUTCOME_IDEMPOTENT_REPLAY = 6;
+}
+
+message Command {
+  string command_id = 1;
+  oneof kind {
+    DiagnosticRequest diagnostic = 2;
+    LogRequest logs = 3;
+    DrainRequest drain = 4;
+    string custom = 5; // forward-compat; future RPC kinds
+  }
+}
+
+message DiagnosticRequest {
+  string command_id = 1;
+  string kind = 2; // "ping" | "config_dump" | "plugin_state"
+  google.protobuf.Duration timeout = 3;
+}
+
+message DiagnosticResult {
+  string command_id = 1;
+  bytes payload = 2;
+  string error = 3;
+}
+
+message LogRequest {
+  string command_id = 1;
+  uint32 tail_lines = 2;
+  google.protobuf.Duration since = 3;
+  bool follow = 4;
+}
+
+message LogChunk {
+  string command_id = 1;
+  bytes lines = 2; // newline-delimited
+  bool last_chunk = 3;
+}
+
+message DrainRequest {
+  google.protobuf.Duration grace = 1;
+}
+
+message CredentialRotation {
+  string client_cert_pem = 1;
+  string client_key_pem = 2;
+  string instance_jwt = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  // E.4 — re-issued payload-DEK + version. Idempotent: until
+  // operator-triggered rotation, this carries the same DEK
+  // every cycle; gateways that miss a rotation just re-load
+  // the same key. When empty, the gateway keeps its cached DEK
+  // (CP didn't touch the key on this rotation).
+  bytes payload_dek = 5;
+  uint32 payload_dek_version = 6;
+}
+
+message Quarantine {
+  string reason = 1;
+}
+
+message CommandResult {
+  string command_id = 1;
+  bool success = 2;
+  string error = 3;
+  bytes payload = 4;
+}
+
+// ─────────────── Unary fallbacks ───────────────
+
+message PullConfigRequest {
+  string instance_id = 1;
+  string current_config_hash = 2;
+}
+message PullConfigResponse {
+  bool changed = 1;
+  ConfigBundle bundle = 2;
+}
+
+message HeartbeatRequest {
+  string instance_id = 1;
+  Heartbeat heartbeat = 2;
+  // Hash of the config bundle the agent currently has applied.
+  // When set, CP compares to its expected hash for this instance
+  // and signals `config_dirty` if they differ. Empty for legacy
+  // clients — CP falls back to comparing against the binding's
+  // last_ack_hash captured from prior Channel ConfigAcks.
+  string current_config_hash = 3;
+}
+message HeartbeatResponse {
+  bool ok = 1;
+  // If true, instance should call Channel ASAP — config has
+  // changed.
+  bool config_dirty = 2;
+  // CP-side hash of the config the instance is expected to be
+  // running. Empty when there is no binding for the instance.
+  // Diagnostic: lets the agent log the mismatch without an extra
+  // PullConfig round-trip.
+  string expected_config_hash = 3;
+  // E.3 — quota status baseline. Carried on every heartbeat so a
+  // gateway that missed a fast-path `ServerMessage::QuotaStatus`
+  // push (channel hiccup, replica restart) converges within the
+  // heartbeat interval (default 30s). Unset when the org has no
+  // metered quota or CP can't compute (e.g. degraded backend).
+  optional QuotaStatus quota_status = 4;
+}
+
+message DeregisterRequest {
+  string instance_id = 1;
+  string reason = 2;
+}
+message DeregisterResponse { bool acknowledged = 1; }

@@ -1,0 +1,14 @@
+-- Per-tunnel high-water mark of metered bytes.
+--
+-- The relay used to send the bytes it had accumulated since its last flush,
+-- zeroing its own counter first. A heartbeat lost in flight — a CP restart, a
+-- timeout, a 5xx — therefore discarded those bytes permanently, and retrying
+-- was unsafe because a redelivered delta would be added twice.
+--
+-- The relay now sends a total that is monotonic for the tunnel's lifetime and
+-- the control plane bills the growth against this column. A duplicate or
+-- reordered heartbeat contributes nothing, and a dropped one is recovered by
+-- the next, with no retry machinery on either side.
+--
+-- Reset at registration: a reconnecting tunnel restarts its counter at zero.
+ALTER TABLE tunnels ADD COLUMN metered_bytes BIGINT NOT NULL DEFAULT 0;

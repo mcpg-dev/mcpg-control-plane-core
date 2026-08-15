@@ -1,0 +1,16 @@
+-- How an installed license got here.
+--
+-- `broker` rows are fetched from the license issuer by the refresh loop or a
+-- login; `offline` rows come from a sales-signed token mounted at boot
+-- (MCPG_CP_LICENSE_FILE) and the issuer knows nothing about them.
+--
+-- The refresh loop treats an issuer 404 as "not licensed here, leave it alone",
+-- because a 404 also describes an offline install. That is correct for offline
+-- rows and wrong for broker ones: a deleted federation org keeps its paid
+-- entitlements until the token's own exp, up to a year. Provenance lets the
+-- loop revoke the rows it owns without touching the ones it does not.
+--
+-- Existing rows default to `broker`: every row that predates this column was
+-- written by a login or the refresh loop, and the offline installer re-writes
+-- its row on every boot, so a mislabelled offline row self-corrects.
+ALTER TABLE federation_licenses ADD COLUMN source TEXT NOT NULL DEFAULT 'broker';
