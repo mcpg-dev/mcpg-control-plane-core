@@ -15,6 +15,7 @@ pub mod env_aliases;
 pub mod error;
 pub use mcpg_control_plane_license::ids;
 pub use mcpg_control_plane_license::license;
+pub mod migrations;
 pub mod model;
 pub mod provider;
 pub mod publish_guard;
