@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-control-plane-core"
-version = "0.1.0-beta.16"
+version = "0.1.0-beta.17"
 edition = "2024"
 license = "Apache-2.0"
 description = "Shared types, traits, and protocol definitions for the MCPG Control Plane."
@@ -21,7 +21,7 @@ tier2 = ["postgres"]
 kms = ["dep:reqwest"]
 
 [dependencies]
-mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15" }
+mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.16", version = "=0.1.0-beta.16" }
 sha2 = "0.10"
 # Async runtime
 tokio = { version = "1", features = ["full"] }

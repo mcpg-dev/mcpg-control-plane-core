@@ -70,6 +70,8 @@ const CRED_OPENER: &str = "${cred://";
 /// Secret-provider URI schemes that read POD-local host resources. Both carry
 /// `//`, so they can't collide with a YAML/TOML key named `env`/`file`.
 const HOST_SECRET_SCHEMES: [&str; 2] = ["env://", "file://"];
+/// The one key that turns off the private-address pin, wherever it appears.
+const PRIVATE_BACKENDS_KEY: &str = "allow_private_backends";
 
 /// Validate a raw tenant-published config (YAML or TOML text). Returns the full
 /// set of violations so the operator sees every problem at once, not one per
@@ -102,23 +104,28 @@ pub fn check_published_config(raw: &str) -> Result<(), PublishGuardError> {
 }
 
 /// Reject constructs that would let a tenant-published config reach the pod's
-/// internal network (SSRF). The gateway's runtime pin already blocks federation
-/// upstreams that *resolve* to private IPs — **unless** `allow_private_backends`
-/// is set, which is exactly the bypass a published config must not carry. We
-/// also reject federation upstreams whose URL host is a literal private IP or an
-/// obvious local name (the static guard can't DNS-resolve, so the runtime pin
-/// remains the backstop for public names that resolve privately). The sanctioned
-/// same-org private path is a `tunnel://<name>` upstream, which is not gated
-/// here — it egresses through the authenticated relay, not a raw private IP.
+/// internal network (SSRF). The gateway's runtime pin already blocks backends
+/// that *resolve* to private IPs — **unless** `allow_private_backends` is set,
+/// which is exactly the bypass a published config must not carry, at whichever
+/// level it is written. We also reject federation upstreams whose URL
+/// host is a literal private IP or an obvious local name (the static guard can't
+/// DNS-resolve, so the runtime pin remains the backstop for public names that
+/// resolve privately). The sanctioned same-org private path is a
+/// `tunnel://<name>` upstream, which is not gated here — it egresses through the
+/// authenticated relay, not a raw private IP.
 fn check_ssrf(cfg: &serde_json::Value, violations: &mut Vec<Violation>) {
-    if cfg
-        .pointer("/gateway/server/allow_private_backends")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
+    // `allow_private_backends` means the same thing wherever it sits:
+    // `gateway.server`, a federation's `upstream_safety`, a registry's, and a
+    // binding's own `backend` — which the gateway hands to a backend plugin
+    // unparsed, so no schema on this side can enumerate where it may appear.
+    // Searching for the key closes the surface that a list of paths reopens
+    // every time a new one is added.
+    let mut seen: Vec<String> = Vec::new();
+    collect_private_backends(cfg, &mut String::new(), &mut seen);
+    for path in seen {
         violations.push(Violation {
             kind: "private_backends_enabled",
-            snippet: "gateway.server.allow_private_backends: true".to_owned(),
+            snippet: format!("{path}: true"),
         });
     }
 
@@ -126,17 +133,6 @@ fn check_ssrf(cfg: &serde_json::Value, violations: &mut Vec<Violation>) {
         return;
     };
     for fed in feds {
-        if fed
-            .pointer("/upstream/upstream_safety/allow_private_backends")
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
-            violations.push(Violation {
-                kind: "private_backends_enabled",
-                snippet: "mcp.federations[].upstream.upstream_safety.allow_private_backends: true"
-                    .to_owned(),
-            });
-        }
         if let Some(url) = fed.pointer("/upstream/url").and_then(|v| v.as_str())
             && let Some(host) = gated_upstream_host(url)
             && is_private_or_local_host(&host)
@@ -146,6 +142,41 @@ fn check_ssrf(cfg: &serde_json::Value, violations: &mut Vec<Violation>) {
                 snippet: truncate(url),
             });
         }
+    }
+}
+
+/// Every `allow_private_backends: true` in the document, as a dotted path with
+/// `[]` for a list. Two bindings that both set it collapse to one entry: the
+/// path is what the operator has to go and edit, and repeating it says nothing
+/// the first line did not.
+fn collect_private_backends(value: &serde_json::Value, path: &mut String, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let base = path.len();
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(key);
+                if key == PRIVATE_BACKENDS_KEY {
+                    if child.as_bool() == Some(true) && !out.iter().any(|seen| seen == path) {
+                        out.push(path.clone());
+                    }
+                } else {
+                    collect_private_backends(child, path, out);
+                }
+                path.truncate(base);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let base = path.len();
+            path.push_str("[]");
+            for item in items {
+                collect_private_backends(item, path, out);
+            }
+            path.truncate(base);
+        }
+        _ => {}
     }
 }
 
@@ -709,6 +740,64 @@ audience = "mcpg-acme"
                 .any(|v| v.kind == "private_backends_enabled"),
             "expected private_backends_enabled, got {:?}",
             err.violations
+        );
+    }
+
+    #[test]
+    fn rejects_binding_level_private_backends() {
+        // A binding's `backend:` block is a plugin spec the gateway forwards
+        // unparsed, so this level is reachable without touching either of the
+        // two the guard used to name.
+        let cfg = r#"
+            mcp:
+              capabilities:
+                tools:
+                  - name: hass.states.list
+                    backend:
+                      kind: http
+                      url: "https://hass.local/api/states"
+                      allow_private_backends: true
+        "#;
+        let err = check_published_config(cfg).unwrap_err();
+        assert!(
+            err.violations.contains(&Violation {
+                kind: "private_backends_enabled",
+                snippet: "mcp.capabilities.tools[].backend.allow_private_backends: true".to_owned(),
+            }),
+            "expected the binding path to be named, got {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn reports_one_private_backends_violation_per_path() {
+        // Four bindings, one path: the operator edits one place, and four
+        // identical lines say nothing the first did not.
+        let cfg = r#"
+            mcp:
+              capabilities:
+                tools:
+                  - name: a
+                    backend: { kind: http, allow_private_backends: true }
+                  - name: b
+                    backend: { kind: http, allow_private_backends: true }
+                resources:
+                  - name: c
+                    backend: { kind: http, allow_private_backends: true }
+        "#;
+        let err = check_published_config(cfg).unwrap_err();
+        let paths: Vec<&str> = err
+            .violations
+            .iter()
+            .filter(|v| v.kind == "private_backends_enabled")
+            .map(|v| v.snippet.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "mcp.capabilities.tools[].backend.allow_private_backends: true",
+                "mcp.capabilities.resources[].backend.allow_private_backends: true",
+            ]
         );
     }
 
