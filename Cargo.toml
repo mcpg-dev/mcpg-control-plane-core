@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-control-plane-core"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 edition = "2024"
 license = "Apache-2.0"
 description = "Shared types, traits, and protocol definitions for the MCPG Control Plane."
@@ -21,7 +21,7 @@ tier2 = ["postgres"]
 kms = ["dep:reqwest"]
 
 [dependencies]
-mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.16", version = "=0.1.0-beta.16" }
+mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.17", version = "=0.1.0-beta.17" }
 sha2 = "0.10"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,6 +39,7 @@ tracing = "0.1"
 # Serde + JSON / YAML / TOML
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = { version = "0.28", default-features = false }
 serde_yaml = "0.9"
 # Published gateway configs arrive as YAML or TOML; the publish guard
 # parses both to verify the cloud auth posture (require_cloud_auth).

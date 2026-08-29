@@ -20,6 +20,7 @@ pub mod model;
 pub mod provider;
 pub mod publish_guard;
 pub mod ratelimit;
+pub mod target_validate;
 pub mod tls_init;
 pub mod usage_report;
 
