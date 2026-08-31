@@ -786,17 +786,20 @@ audience = "mcpg-acme"
                     backend: { kind: http, allow_private_backends: true }
         "#;
         let err = check_published_config(cfg).unwrap_err();
-        let paths: Vec<&str> = err
+        // Collection order follows map iteration and is not part of the
+        // contract — compare as sets.
+        let mut paths: Vec<&str> = err
             .violations
             .iter()
             .filter(|v| v.kind == "private_backends_enabled")
             .map(|v| v.snippet.as_str())
             .collect();
+        paths.sort_unstable();
         assert_eq!(
             paths,
             vec![
-                "mcp.capabilities.tools[].backend.allow_private_backends: true",
                 "mcp.capabilities.resources[].backend.allow_private_backends: true",
+                "mcp.capabilities.tools[].backend.allow_private_backends: true",
             ]
         );
     }
