@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-control-plane-core"
-version = "0.1.0-beta.20"
+version = "0.1.0-beta.21"
 edition = "2024"
 license = "Apache-2.0"
 description = "Shared types, traits, and protocol definitions for the MCPG Control Plane."
