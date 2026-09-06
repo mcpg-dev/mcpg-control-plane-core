@@ -185,6 +185,25 @@ message StatusReport {
   repeated PluginStatus plugins = 3;
   ResourceUsage resources = 4;
   repeated string warnings = 5;
+  // Clustering health for multi-replica gateways. Unset on agents
+  // that predate the field.
+  ClusterStatus cluster = 6;
+}
+
+// Coordinator health as the reporting replica sees it. A
+// single_node gateway reports `{kind: "single_node"}` with both
+// optionals unset.
+message ClusterStatus {
+  // Coordinator kind: "single_node" | "nats" | "redis" | "consul"
+  // | "etcd" | a plugin-class kind.
+  string kind = 1;
+  // Whether the coordinator answered the replica's most recent KV
+  // health ping. Unset until the first probe completes — and always
+  // for single_node / KV-less coordinators, which are never probed.
+  optional bool backend_up = 2;
+  // Cluster members visible to this replica, itself included.
+  // Unset when the coordinator cannot enumerate peers.
+  optional uint32 peers = 3;
 }
 
 message PluginStatus {
