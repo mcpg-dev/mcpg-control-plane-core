@@ -3,16 +3,41 @@
 //! The platform runs one admin-blessed gateway release, and a tenant's config
 //! is only accepted when it validates against THAT build's capability
 //! manifest (`mcpg capabilities`): the config must satisfy the target's own
-//! JSON schema, and every plugin reference must resolve to something the
-//! release ships — with no tenant-chosen version anywhere. Runs on publish
-//! AND on redeploy, and fails closed: a manifest this module cannot
-//! understand rejects the config rather than waving it through.
+//! JSON schema, and every plugin reference must be one the tenant's plan
+//! permits. Runs on publish AND on redeploy, and fails closed: a manifest
+//! this module cannot understand rejects the config rather than waving it
+//! through.
 //!
 //! [`publish_guard`](crate::publish_guard) stays the security gate (host-read
 //! exfil constructs); this module is the compatibility gate. Both must pass.
 
 use serde::Deserialize;
 use std::fmt;
+
+/// Registry path first-party plugins publish under. NB the path segment is the
+/// plugin's hyphenated SHORT name (`identity-oidc`), not its dotted id
+/// (`dev.mcpg.identity.oidc`) — reusing the id as the path is the natural
+/// mistake and 404s at boot, where OCI resolution is fail-closed.
+pub const FIRST_PARTY_PLUGIN_PREFIX: &str = "ghcr.io/mcpg-dev/plugins/";
+
+/// Which plugins a tenant may reference from its config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginPolicy {
+    /// First-party plugins only. The default for every plan.
+    FirstPartyOnly,
+    /// Any registry, including the tenant's own published plugins.
+    /// Enterprise.
+    AllowCustom,
+}
+
+/// True when `reference` names a plugin published by the platform. Tolerates a
+/// leading `oci://` and an explicit `docker.io`-style host already being
+/// present; anything else is treated as third-party.
+pub fn is_first_party_plugin_ref(reference: &str) -> bool {
+    reference
+        .trim_start_matches("oci://")
+        .starts_with(FIRST_PARTY_PLUGIN_PREFIX)
+}
 
 /// The slice of `mcpg capabilities` output this validator consumes. Additive
 /// manifest fields are ignored by construction; a `manifest_version` above
@@ -37,7 +62,7 @@ const MAX_UNDERSTOOD_MANIFEST: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetViolation {
-    /// Machine-stable kind (`schema_mismatch`, `plugin_version_pinned`,
+    /// Machine-stable kind (`schema_mismatch`, `plugin_not_first_party`,
     /// `plugin_not_in_release`, `manifest_not_understood`,
     /// `config_unparseable`).
     pub kind: &'static str,
@@ -74,6 +99,7 @@ impl std::error::Error for TargetValidationError {}
 pub fn validate_against_gateway(
     raw: &str,
     caps: &GatewayCapabilities,
+    policy: PluginPolicy,
 ) -> Result<(), TargetValidationError> {
     let mut violations = Vec::new();
 
@@ -122,42 +148,52 @@ pub fn validate_against_gateway(
         }
     }
 
-    // 2. Plugin references. Zero tenant version control: an `oci:` source may
-    //    only float on the release's protocol tag (or carry no tag at all —
-    //    the gateway resolver applies the same protocol default); `path:`
-    //    sources must name a plugin the image bakes.
-    let proto_major = caps
-        .plugin_protocol_version
-        .split('.')
-        .next()
-        .unwrap_or_default();
-    let floating = format!("protocol-{proto_major}");
+    // 2. Plugin references. Plugins are never bundled with the gateway: a
+    //    deployment names them in config and the runtime fetches them from
+    //    OCI. A tenant therefore pins whatever version it wants, including a
+    //    digest — the honest supply-chain form. Integrity is carried by
+    //    signature verification and the revocation list, not by withholding
+    //    the pin; the cost of a tenant pinning a stale plugin is theirs, and
+    //    revocation still refuses a withdrawn artefact.
+    //
+    //    WHOSE plugins is the plan question: first-party only by default,
+    //    any registry under `PluginPolicy::AllowCustom`. `path:` sources
+    //    still have to name something the image carries.
     for (idx, entry) in plugin_entries(&value) {
         let at = format!("plugins[{idx}]");
         match entry {
             PluginSource::Oci(reference) => {
-                match tag_of(&reference) {
-                    None => {}
-                    Some(tag) if tag == floating => {}
-                    Some(tag) => violations.push(TargetViolation {
-                        kind: "plugin_version_pinned",
-                        detail: format!(
-                            "{at}: `{reference}` pins `{tag}` — plugin versions are \
-                             platform-managed; reference `:{floating}` or drop the tag"
-                        ),
-                    }),
-                }
-                if reference.contains("@sha256:") {
+                if policy == PluginPolicy::FirstPartyOnly && !is_first_party_plugin_ref(&reference)
+                {
                     violations.push(TargetViolation {
-                        kind: "plugin_version_pinned",
+                        kind: "plugin_not_first_party",
                         detail: format!(
-                            "{at}: `{reference}` pins a digest — plugin versions are \
-                             platform-managed; reference `:{floating}` or drop the tag"
+                            "{at}: `{reference}` is not a first-party plugin \
+                             (`{FIRST_PARTY_PLUGIN_PREFIX}…`) — referencing your own \
+                             plugins requires an enterprise subscription"
                         ),
                     });
                 }
             }
             PluginSource::Path(path) => {
+                // A release that bundles no plugins cannot satisfy ANY `path:`
+                // source, so say that rather than reporting the reference as
+                // absent from a set of zero — which reads as a missing file and
+                // sends the author looking for it in the image.
+                if caps.baked_plugins.is_empty() {
+                    violations.push(TargetViolation {
+                        kind: "plugin_source_not_supported",
+                        detail: format!(
+                            "{at}: `{path}` is a file in the gateway image, and images \
+                             carry no plugins — name the plugin with `source.oci` \
+                             (e.g. `{FIRST_PARTY_PLUGIN_PREFIX}<short-name>`) and the \
+                             runtime will fetch, verify and cache it"
+                        ),
+                    });
+                    continue;
+                }
+                // An older blessed release may still bundle a set; keep
+                // validating against what that image actually carries.
                 let known = caps
                     .baked_plugins
                     .iter()
@@ -207,17 +243,6 @@ fn plugin_entries(value: &serde_json::Value) -> Vec<(usize, PluginSource)> {
     out
 }
 
-/// The tag of an OCI reference, if it carries one. A `:` before the first
-/// `/` is a registry port, not a tag; a digest is not a tag.
-fn tag_of(reference: &str) -> Option<String> {
-    let after_digest = reference.split("@sha256:").next().unwrap_or(reference);
-    let last_segment = after_digest.rsplit('/').next().unwrap_or(after_digest);
-    last_segment
-        .split_once(':')
-        .map(|(_, tag)| tag.to_owned())
-        .filter(|t| !t.is_empty())
-}
-
 fn parse_structured(raw: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_yaml::from_str::<serde_json::Value>(raw)
         && v.is_object()
@@ -259,11 +284,14 @@ plugins:
   - id: dev.mcpg.backend.http
     source: { oci: "ghcr.io/mcpg-dev/plugins/backend-http:protocol-1" }
 "#;
-        validate_against_gateway(cfg, &caps(permissive())).unwrap();
+        validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::FirstPartyOnly).unwrap();
     }
 
+    /// Plugins are config-defined and fetched from OCI, so a tenant pins the
+    /// version it wants — including a digest, which is the form a supply-chain
+    /// story actually needs.
     #[test]
-    fn version_pin_and_digest_are_rejected() {
+    fn version_pin_and_digest_are_allowed_on_first_party() {
         let cfg = r#"
 plugins:
   - id: a
@@ -271,23 +299,57 @@ plugins:
   - id: b
     source: { oci: "ghcr.io/mcpg-dev/plugins/backend-http@sha256:0000000000000000000000000000000000000000000000000000000000000000" }
 "#;
-        let err = validate_against_gateway(cfg, &caps(permissive())).unwrap_err();
-        assert_eq!(err.violations.len(), 2);
-        assert!(
-            err.violations
-                .iter()
-                .all(|v| v.kind == "plugin_version_pinned")
-        );
+        validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::FirstPartyOnly).unwrap();
     }
 
     #[test]
-    fn registry_port_is_not_a_tag() {
+    fn third_party_ref_needs_enterprise() {
+        let cfg = r#"
+plugins:
+  - id: dev.instruction.backend.s3
+    source: { oci: "ghcr.io/instruction-md/mcpg-plugin-instruction-s3@sha256:0000000000000000000000000000000000000000000000000000000000000000" }
+"#;
+        let err = validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::FirstPartyOnly)
+            .unwrap_err();
+        assert_eq!(err.violations[0].kind, "plugin_not_first_party");
+        // The same config is legitimate once the plan allows it.
+        validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::AllowCustom).unwrap();
+    }
+
+    /// A private registry is third-party by definition — it is not the
+    /// platform's namespace, whatever its host looks like.
+    #[test]
+    fn private_registry_is_third_party() {
         let cfg = r#"
 plugins:
   - id: a
     source: { oci: "registry.internal:5000/plugins/backend-http" }
 "#;
-        validate_against_gateway(cfg, &caps(permissive())).unwrap();
+        let err = validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::FirstPartyOnly)
+            .unwrap_err();
+        assert_eq!(err.violations[0].kind, "plugin_not_first_party");
+        validate_against_gateway(cfg, &caps(permissive()), PluginPolicy::AllowCustom).unwrap();
+    }
+
+    /// Images carry no plugins, so a `path:` source cannot resolve. The
+    /// message has to say that — "not among 0 baked plugins" reads as a
+    /// missing file and sends the author into the image looking for it.
+    #[test]
+    fn path_source_is_refused_when_the_release_bundles_nothing() {
+        let cfg = r#"
+plugins:
+  - id: dev.mcpg.backend.http
+    source: { path: "/usr/local/lib/mcpg/plugins/dev.mcpg.backend.http/plugin.so" }
+"#;
+        let mut c = caps(permissive());
+        c.baked_plugins.clear();
+        let err = validate_against_gateway(cfg, &c, PluginPolicy::FirstPartyOnly).unwrap_err();
+        assert_eq!(err.violations[0].kind, "plugin_source_not_supported");
+        assert!(
+            err.violations[0].detail.contains("source.oci"),
+            "the refusal must name the replacement: {}",
+            err.violations[0].detail
+        );
     }
 
     #[test]
@@ -297,9 +359,10 @@ plugins:
   - id: dev.mcpg.backend.http
     source: { path: "/usr/local/lib/mcpg/plugins/dev.mcpg.backend.http/plugin.so" }
 "#;
-        validate_against_gateway(ok, &caps(permissive())).unwrap();
+        validate_against_gateway(ok, &caps(permissive()), PluginPolicy::FirstPartyOnly).unwrap();
         let bad = ok.replace("backend.http", "backend.smb");
-        let err = validate_against_gateway(&bad, &caps(permissive())).unwrap_err();
+        let err = validate_against_gateway(&bad, &caps(permissive()), PluginPolicy::FirstPartyOnly)
+            .unwrap_err();
         assert_eq!(err.violations[0].kind, "plugin_not_in_release");
     }
 
@@ -310,7 +373,12 @@ plugins:
             "properties": {"gateway": {"type": "object"}},
             "additionalProperties": false
         });
-        let err = validate_against_gateway("gatway:\n  x: 1\n", &caps(schema)).unwrap_err();
+        let err = validate_against_gateway(
+            "gatway:\n  x: 1\n",
+            &caps(schema),
+            PluginPolicy::FirstPartyOnly,
+        )
+        .unwrap_err();
         assert_eq!(err.violations[0].kind, "schema_mismatch");
         assert!(err.violations[0].detail.contains("gatway"));
     }
@@ -319,7 +387,8 @@ plugins:
     fn future_manifest_fails_closed() {
         let mut c = caps(permissive());
         c.manifest_version = 99;
-        let err = validate_against_gateway("gateway: {}\n", &c).unwrap_err();
+        let err = validate_against_gateway("gateway: {}\n", &c, PluginPolicy::FirstPartyOnly)
+            .unwrap_err();
         assert_eq!(err.violations[0].kind, "manifest_not_understood");
     }
 }
