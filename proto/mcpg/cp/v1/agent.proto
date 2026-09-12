@@ -188,6 +188,13 @@ message StatusReport {
   // Clustering health for multi-replica gateways. Unset on agents
   // that predate the field.
   ClusterStatus cluster = 6;
+  // Digest of the secrets directory the running runtime was built from:
+  // sha256 over `NAME=VALUE\n` for every key in sorted order, hex, read at
+  // boot and at every successful reload. The control plane computes the
+  // same digest over the registered set, so it can tell "live" from
+  // "pending" without either side sending a value. Empty when the gateway
+  // has no secrets directory or it holds no key.
+  string secrets_digest = 7;
 }
 
 // Coordinator health as the reporting replica sees it. A

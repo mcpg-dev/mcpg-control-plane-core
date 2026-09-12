@@ -6,11 +6,19 @@
 //! Two of those resolutions read host resources at config-load time and must
 //! NOT be reachable from a tenant-authored config:
 //!
-//! - **CEL env interpolation** `${env.X}` / `${env.X}` — expanded against the
-//!   POD's environment at load (see `libs/expr`). A tenant could read platform
-//!   pod-env (downward-API values, future injected secrets) this way.
+//! - **CEL env interpolation** `${env.X}` — expanded against the POD's
+//!   environment at load (see `libs/expr`). A tenant could read platform
+//!   pod-env (the enrollment URL, the cluster material, downward-API values)
+//!   this way.
 //! - **`env://` / `file://` secret-provider URIs** — resolve against pod env /
 //!   filesystem. Same host-read exfil surface.
+//!
+//! The tenant's own values travel a separate channel: a key registered
+//! through the control plane is mounted into the pod as a file and read as
+//! `${secret.NAME}`. The guard admits exactly the registered names
+//! ([`check_published_config_with_secret_keys`]); an unregistered one would
+//! fail at load, so it is refused here where the publisher can act on it.
+//! [`is_secret_key`] is the one grammar every side applies to a name.
 //!
 //! The guard runs **before** the config is handed to the provisioner (CP
 //! publish handler) — and is reusable by the `mcpg cloud` CLI pre-flight and a
@@ -33,8 +41,8 @@ use std::fmt;
 /// A single rejected construct, with enough context for a useful CLI/API error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
-    /// Machine-stable kind (`host_env_interpolation`, `host_secret_uri`,
-    /// `malformed_cred_token`).
+    /// Machine-stable kind (`host_env_interpolation`, `unregistered_secret`,
+    /// `host_secret_uri`, `malformed_cred_token`).
     pub kind: &'static str,
     /// The offending token / fragment (truncated), for the operator's message.
     pub snippet: String,
@@ -64,31 +72,53 @@ impl fmt::Display for PublishGuardError {
 
 impl std::error::Error for PublishGuardError {}
 
-/// The environment-variable namespace a tenant's own secrets occupy. The
-/// platform never sets a variable under it — its settings overrides are
-/// `MCPG_*`, its projected credentials `MCPG_*` too — so a name in it can
-/// only ever be one the tenant registered, and one outside it can never be.
-pub const TENANT_KEY_PREFIX: &str = "TENANT_";
+/// Longest secret key a tenant may register.
+pub const SECRET_KEY_MAX_LEN: usize = 64;
 
-/// Longest key a tenant may register, prefix included.
-pub const TENANT_KEY_MAX_LEN: usize = 64;
-
-/// Whether `name` is a well-formed tenant secret key: `TENANT_` followed by
-/// 1..=57 characters of `[A-Z0-9_]`. Refused, never normalised — a key that
+/// Whether `name` is a well-formed secret key: `[A-Za-z_][A-Za-z0-9_]{0,63}`
+/// — a CEL identifier, which is also a file name under the mounted secret
+/// directory. Case-sensitive, refused rather than normalised: a key that
 /// needed lowercasing or trimming to fit is not the key the config names.
-pub fn is_tenant_secret_key(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(TENANT_KEY_PREFIX) else {
+/// The control plane applies it at registration, the guard when a config
+/// references a key, and the provisioner and gateway again on delivery.
+pub fn is_secret_key(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
         return false;
     };
-    !rest.is_empty()
-        && name.len() <= TENANT_KEY_MAX_LEN
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    name.len() <= SECRET_KEY_MAX_LEN
+        && (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Digest of a secret set: hex sha256 over `NAME=VALUE\n` for every key in
+/// sorted order. The control plane computes it over the registered set, the
+/// provisioner over what it delivered, and the gateway over what it resolved,
+/// so "live" versus "pending" is a comparison of digests — no side ever sends
+/// a value. Empty when there are no keys, which is also what a gateway
+/// reports when it resolves no `${secret.*}` reference.
+pub fn secrets_digest<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    use sha2::Digest as _;
+    let mut entries: Vec<(&str, &str)> = secrets.into_iter().collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    entries.sort_unstable();
+    let mut hasher = sha2::Sha256::new();
+    for (name, value) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// CEL env-interpolation opener, matching `libs/expr`'s parser.
 const ENV_OPENERS: [&str; 1] = ["${env."];
+/// Tenant-secret interpolation opener (`${secret.NAME}`), resolved by the
+/// gateway from its mounted secret directory.
+const SECRET_OPENER: &str = "${secret.";
 /// Credential-token opener (`${cred://plugin/target}`).
 const CRED_OPENER: &str = "${cred://";
 /// Secret-provider URI schemes that read POD-local host resources. Both carry
@@ -101,20 +131,19 @@ const PRIVATE_BACKENDS_KEY: &str = "allow_private_backends";
 /// set of violations so the operator sees every problem at once, not one per
 /// round-trip.
 pub fn check_published_config(raw: &str) -> Result<(), PublishGuardError> {
-    check_published_config_with_tenant_keys(raw, &BTreeSet::new())
+    check_published_config_with_secret_keys(raw, &BTreeSet::new())
 }
 
-/// [`check_published_config`] with the tenant's own secret channel open: a
-/// `${env.X}` is admitted iff `X` is a key the tenant registered through the
-/// control plane — a name in the reserved [`TENANT_KEY_PREFIX`] namespace
-/// that the platform never uses — and refused otherwise, exactly as before.
-/// The pod's environment carries the platform's own credentials (the
-/// enrollment URL, the cluster material), and a tenant reference to one of
-/// those is an exfiltration; the allowlist is what keeps them unreachable
-/// while the tenant's registered values are not.
-pub fn check_published_config_with_tenant_keys(
+/// [`check_published_config`] with the tenant's registered secret keys: a
+/// `${secret.X}` is admitted iff `X` is in `secret_keys` and refused as
+/// `unregistered_secret` otherwise — the gateway would fail to load a config
+/// naming a key its mount does not hold, and the publisher can act on it
+/// here. `${env.…}` stays refused whatever the set holds: the pod's
+/// environment is the platform's, and the tenant's values are files, not
+/// variables.
+pub fn check_published_config_with_secret_keys(
     raw: &str,
-    tenant_keys: &BTreeSet<String>,
+    secret_keys: &BTreeSet<String>,
 ) -> Result<(), PublishGuardError> {
     // Parse once, then inspect only leaf STRING VALUES. Object keys are never
     // visited and comments are dropped by the parser, so a forbidden token in a
@@ -133,7 +162,7 @@ pub fn check_published_config_with_tenant_keys(
 
     let mut violations = Vec::new();
     walk_leaf_strings(&cfg, &mut |leaf| {
-        check_leaf_value(leaf, tenant_keys, &mut violations)
+        check_leaf_value(leaf, secret_keys, &mut violations)
     });
     check_ssrf(&cfg, &mut violations);
 
@@ -303,26 +332,35 @@ fn walk_leaf_strings(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// Run the three host-read checks against one leaf string value.
-fn check_leaf_value(value: &str, tenant_keys: &BTreeSet<String>, violations: &mut Vec<Violation>) {
-    // 1. Host-env interpolation `${env.X}` — admitted only for a key the
-    //    tenant registered (and so in the reserved namespace); every other
-    //    name reads the pod's own environment.
+/// Run the host-read and secret-reference checks against one leaf string value.
+fn check_leaf_value(value: &str, secret_keys: &BTreeSet<String>, violations: &mut Vec<Violation>) {
+    // 1. Host-env interpolation `${env.X}` — every name reads the pod's own
+    //    environment.
     for opener in ENV_OPENERS {
         for snippet in tokens_from(value, opener, '}') {
-            let name = snippet
-                .strip_prefix(opener)
-                .and_then(|s| s.strip_suffix('}'))
-                .unwrap_or_default()
-                .trim();
-            if is_tenant_secret_key(name) && tenant_keys.contains(name) {
-                continue;
-            }
             violations.push(Violation {
                 kind: "host_env_interpolation",
                 snippet,
             });
         }
+    }
+
+    // 1b. Tenant-secret interpolation `${secret.X}` — admitted only for a key
+    //     registered for this gateway. The grammar sits in front of the set:
+    //     a name outside it is not a file the gateway would read, whatever a
+    //     caller lists.
+    for snippet in tokens_from(value, SECRET_OPENER, '}') {
+        let name = snippet
+            .strip_prefix(SECRET_OPENER)
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or_default();
+        if is_secret_key(name) && secret_keys.contains(name) {
+            continue;
+        }
+        violations.push(Violation {
+            kind: "unregistered_secret",
+            snippet,
+        });
     }
 
     // 2. `${cred://...}` tokens — allowed, but must be well-formed
@@ -548,73 +586,146 @@ mod tests {
         names.iter().map(|k| (*k).to_owned()).collect()
     }
 
-    /// The tenant channel admits exactly the keys the tenant registered:
-    /// a registered `TENANT_*` name passes, an unregistered one in the same
-    /// namespace is refused, and a platform name is refused even when a
-    /// caller somehow lists it — the grammar sits in front of the allowlist.
+    /// A `${secret.X}` config reference, inline in a larger string.
+    fn secret_ref_config(name: &str) -> String {
+        format!(
+            "mcp:\n  capabilities:\n    tools:\n      - name: t\n        backend:\n          kind: http\n          headers:\n            authorization: \"Bearer ${{secret.{name}}}\"\n"
+        )
+    }
+
+    /// A registered key is admitted as `${secret.X}`; an unregistered one is
+    /// refused with its own kind and the token as the snippet.
     #[test]
-    fn a_registered_tenant_key_is_admitted_and_nothing_else_is() {
+    fn a_registered_secret_key_is_admitted_and_an_unregistered_one_is_refused() {
+        let registered = keys(&["API_TOKEN"]);
+        assert!(
+            check_published_config_with_secret_keys(&secret_ref_config("API_TOKEN"), &registered)
+                .is_ok()
+        );
+        let err = check_published_config_with_secret_keys(&secret_ref_config("OTHER"), &registered)
+            .expect_err("an unregistered key is refused");
+        assert_eq!(
+            err.violations,
+            vec![Violation {
+                kind: "unregistered_secret",
+                snippet: "${secret.OTHER}".to_owned(),
+            }]
+        );
+        // Case-sensitive: the file the gateway would open is `API_TOKEN`.
+        let err =
+            check_published_config_with_secret_keys(&secret_ref_config("api_token"), &registered)
+                .unwrap_err();
+        assert_eq!(err.violations[0].kind, "unregistered_secret");
+        // A name outside the grammar can never be registered, so it is
+        // unregistered even when a caller lists it.
+        let err = check_published_config_with_secret_keys(
+            &secret_ref_config(" API_TOKEN"),
+            &keys(&[" API_TOKEN"]),
+        )
+        .unwrap_err();
+        assert_eq!(err.violations[0].kind, "unregistered_secret");
+        // The plain entry point admits no secret reference at all.
+        let err = check_published_config(&secret_ref_config("API_TOKEN")).unwrap_err();
+        assert_eq!(err.violations[0].kind, "unregistered_secret");
+        // Every reference in a value is reported, and the other guards keep
+        // running alongside.
+        let mixed = format!(
+            "{}          token: \"${{secret.A}}:${{secret.B}}\"\n          ca: file:///etc/x\n",
+            secret_ref_config("API_TOKEN")
+        );
+        let err = check_published_config_with_secret_keys(&mixed, &keys(&["API_TOKEN", "B"]))
+            .unwrap_err();
+        // Leaf order follows map iteration and is not part of the contract.
+        let mut found: Vec<(&str, &str)> = err
+            .violations
+            .iter()
+            .map(|v| (v.kind, v.snippet.as_str()))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![
+                ("host_secret_uri", "file:///etc/x"),
+                ("unregistered_secret", "${secret.A}"),
+            ],
+            "{err}"
+        );
+    }
+
+    /// `${env.…}` is the pod's environment, never the tenant's channel: it is
+    /// refused whatever is registered, including a name that IS registered.
+    #[test]
+    fn env_interpolation_is_refused_even_for_a_registered_key() {
         let cfg = |name: &str| {
             format!(
                 "mcp:\n  capabilities:\n    tools:\n      - name: t\n        backend:\n          kind: http\n          headers:\n            authorization: \"Bearer ${{env.{name}}}\"\n"
             )
         };
-        let registered = keys(&["TENANT_API_TOKEN"]);
-        assert!(
-            check_published_config_with_tenant_keys(&cfg("TENANT_API_TOKEN"), &registered).is_ok()
-        );
-        let err = check_published_config_with_tenant_keys(&cfg("TENANT_OTHER"), &registered)
-            .expect_err("an unregistered tenant key is refused");
-        assert_eq!(err.violations[0].kind, "host_env_interpolation");
-        assert!(err.violations[0].snippet.contains("TENANT_OTHER"), "{err}");
-        // Platform names are outside the namespace by construction: even a
-        // caller that lists one cannot open it.
-        for platform in [
-            "MCPG_CP_ENROLLMENT_URL",
-            "MCPG_CLUSTER_NATS_TOKEN",
-            "POD_NAME",
-            "PATH",
-        ] {
-            let err = check_published_config_with_tenant_keys(&cfg(platform), &keys(&[platform]))
-                .expect_err(platform);
-            assert_eq!(
-                err.violations[0].kind, "host_env_interpolation",
-                "{platform}"
-            );
+        for name in ["TENANT_X", "API_TOKEN", "MCPG_CP_ENROLLMENT_URL", "PATH"] {
+            let err = check_published_config_with_secret_keys(&cfg(name), &keys(&[name]))
+                .expect_err(name);
+            assert_eq!(err.violations[0].kind, "host_env_interpolation", "{name}");
+            assert_eq!(err.violations[0].snippet, format!("${{env.{name}}}"));
         }
-        // The plain entry point admits nothing, as before.
-        assert!(check_published_config(&cfg("TENANT_API_TOKEN")).is_err());
-        // Other guards keep running with the channel open.
-        let with_file = format!(
-            "{}          token: file:///etc/x\n",
-            cfg("TENANT_API_TOKEN")
-        );
-        let err = check_published_config_with_tenant_keys(&with_file, &registered).unwrap_err();
-        assert!(
-            err.violations.iter().any(|v| v.kind == "host_secret_uri"),
-            "{err}"
-        );
     }
 
     #[test]
-    fn tenant_key_grammar() {
-        for ok in ["TENANT_A", "TENANT_S3_SECRET_KEY", "TENANT_1", "TENANT__X"] {
-            assert!(is_tenant_secret_key(ok), "{ok}");
+    fn secret_key_grammar() {
+        for ok in [
+            "A",
+            "_",
+            "API_TOKEN",
+            "api_token",
+            "TENANT_S3_SECRET_KEY",
+            "camelCase9",
+            "_leading",
+            "a1",
+            &"A".repeat(SECRET_KEY_MAX_LEN),
+        ] {
+            assert!(is_secret_key(ok), "{ok}");
         }
         for bad in [
-            "TENANT_",
-            "tenant_x",
-            "TENANT_lower",
-            "TENANT_A-B",
-            "TENANT_A B",
-            "MCPG_CP_ENROLLMENT_URL",
-            "XTENANT_A",
-            " TENANT_A",
-            &format!("TENANT_{}", "A".repeat(58)),
+            "",
+            "1A",
+            "9",
+            "A-B",
+            "A B",
+            " A",
+            "A ",
+            "A.B",
+            "A/B",
+            "../A",
+            "Ä",
+            "A\n",
+            &"A".repeat(SECRET_KEY_MAX_LEN + 1),
         ] {
-            assert!(!is_tenant_secret_key(bad), "{bad:?} must be refused");
+            assert!(!is_secret_key(bad), "{bad:?} must be refused");
         }
-        assert!(is_tenant_secret_key(&format!("TENANT_{}", "A".repeat(57))));
+    }
+
+    /// The digest is order-independent, value-sensitive, and empty for an
+    /// empty set — the same three properties every side relies on.
+    #[test]
+    fn secrets_digest_recipe() {
+        use sha2::Digest as _;
+        assert_eq!(secrets_digest(std::iter::empty()), "");
+        let expected = format!(
+            "{:x}",
+            sha2::Sha256::digest(b"API_TOKEN=t0k\nSIGNING_KEY=k3y\n")
+        );
+        assert_eq!(
+            secrets_digest([("SIGNING_KEY", "k3y"), ("API_TOKEN", "t0k")]),
+            expected
+        );
+        assert_eq!(
+            secrets_digest([("API_TOKEN", "t0k"), ("SIGNING_KEY", "k3y")]),
+            expected
+        );
+        assert_ne!(
+            secrets_digest([("API_TOKEN", "t0k"), ("SIGNING_KEY", "k3y!")]),
+            expected
+        );
+        assert_ne!(secrets_digest([("API_TOKEN", "t0k")]), expected);
     }
 
     #[test]
