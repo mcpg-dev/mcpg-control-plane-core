@@ -709,10 +709,7 @@ mod tests {
     fn secrets_digest_recipe() {
         use sha2::Digest as _;
         assert_eq!(secrets_digest(std::iter::empty()), "");
-        let expected = format!(
-            "{:x}",
-            sha2::Sha256::digest(b"API_TOKEN=t0k\nSIGNING_KEY=k3y\n")
-        );
+        let expected = hex::encode(sha2::Sha256::digest(b"API_TOKEN=t0k\nSIGNING_KEY=k3y\n"));
         assert_eq!(
             secrets_digest([("SIGNING_KEY", "k3y"), ("API_TOKEN", "t0k")]),
             expected

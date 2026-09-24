@@ -31,8 +31,8 @@
 //! ciphertext, and decryption requires the same master key +
 //! context.
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
 use base64::Engine as _;
 
@@ -96,20 +96,16 @@ impl LocalCipher {
         let key_bytes = base64::engine::general_purpose::STANDARD
             .decode(master_key_b64)
             .map_err(|_| CipherError::BadKey(0))?;
-        if key_bytes.len() != 32 {
-            return Err(CipherError::BadKey(key_bytes.len()));
-        }
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        Ok(Self {
-            cipher: Aes256Gcm::new(key),
-        })
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|_| CipherError::BadKey(key_bytes.len()))?;
+        Ok(Self { cipher })
     }
 }
 
 #[async_trait]
 impl EnvelopeCipher for LocalCipher {
     async fn encrypt(&self, context: &str, plaintext: &[u8]) -> Result<Vec<u8>, CipherError> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::generate();
         let ct = self
             .cipher
             .encrypt(
@@ -127,14 +123,13 @@ impl EnvelopeCipher for LocalCipher {
     }
 
     async fn decrypt(&self, context: &str, ciphertext: &[u8]) -> Result<Vec<u8>, CipherError> {
-        if ciphertext.len() < 12 {
+        let Some((nonce_bytes, ct)) = ciphertext.split_first_chunk::<12>() else {
             return Err(CipherError::Truncated);
-        }
-        let (nonce_bytes, ct) = ciphertext.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        };
+        let nonce = Nonce::from(*nonce_bytes);
         self.cipher
             .decrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: ct,
                     aad: context.as_bytes(),
@@ -293,8 +288,8 @@ mod tests {
 
     fn fresh_master_key_b64() -> String {
         let mut bytes = [0u8; 32];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 

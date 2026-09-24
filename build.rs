@@ -1,5 +1,5 @@
 //! Build script: compile the Agent gRPC contract from
-//! `proto/mcpg/cp/v1/agent.proto` into Rust types via tonic-build.
+//! `proto/mcpg/cp/v1/agent.proto` into Rust types via tonic-prost-build.
 
 use std::path::PathBuf;
 
@@ -31,10 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         includes.push(wkt_include);
     }
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&proto_files, &includes)?;
+        .compile_protos(&proto_files.map(PathBuf::from), &includes)?;
 
     Ok(())
 }
