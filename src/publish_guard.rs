@@ -34,6 +34,10 @@
 //! plugins) — it only validates such tokens are well-formed. External secret
 //! schemes the tenant owns (`vault://`, `aws-sm://`) are likewise allowed; only
 //! the host-reading `env://` / `file://` schemes are blocked.
+//!
+//! [`check_config_entitlements`] is the license half: a config block whose
+//! surface a plan feature withholds (interactive sign-in needs
+//! `sso.interactive_login`) is refused unless the org's claims grant it.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -126,6 +130,9 @@ const CRED_OPENER: &str = "${cred://";
 const HOST_SECRET_SCHEMES: [&str; 2] = ["env://", "file://"];
 /// The one key that turns off the private-address pin, wherever it appears.
 const PRIVATE_BACKENDS_KEY: &str = "allow_private_backends";
+/// The `governance.access` blocks the gateway verifies bearer tokens with —
+/// the same set its `AccessConfig::is_enabled` reads.
+const VERIFIER_KEYS: [&str; 3] = ["jwks", "oidc_oauth", "authorization_server"];
 
 /// Validate a raw tenant-published config (YAML or TOML text). Returns the full
 /// set of violations so the operator sees every problem at once, not one per
@@ -391,12 +398,74 @@ fn check_leaf_value(value: &str, secret_keys: &BTreeSet<String>, violations: &mu
     }
 }
 
+/// The config surfaces a license feature withholds, as
+/// `(feature, dotted path of the block that needs it)`. Only a present,
+/// non-null block counts, as with the verifier blocks.
+pub fn licensed_config_surfaces(cfg: &serde_json::Value) -> Vec<(&'static str, String)> {
+    use mcpg_control_plane_license::license::FEATURE_INTERACTIVE_LOGIN;
+    const SERVER: &str = "governance.access.authorization_server";
+    let mut surfaces = Vec::new();
+    let Some(server) = cfg.pointer("/governance/access/authorization_server") else {
+        return surfaces;
+    };
+    if let Some(idps) = server.get("trusted_idps").and_then(|v| v.as_array()) {
+        for (index, idp) in idps.iter().enumerate() {
+            if is_present_object(idp.get("login")) {
+                let at = match idp.get("issuer").and_then(|v| v.as_str()) {
+                    Some(issuer) => format!("{SERVER}.trusted_idps[`{}`].login", truncate(issuer)),
+                    None => format!("{SERVER}.trusted_idps[{index}].login"),
+                };
+                surfaces.push((FEATURE_INTERACTIVE_LOGIN, at));
+            }
+        }
+    }
+    if is_present_object(server.get("interactive")) {
+        surfaces.push((FEATURE_INTERACTIVE_LOGIN, format!("{SERVER}.interactive")));
+    }
+    surfaces
+}
+
+/// Refuse a published config that configures a surface the org's license
+/// does not grant: interactive sign-in at the embedded authorization server
+/// needs `sso.interactive_login`. Runs on the managed-cloud publish path
+/// with the org's live claims; the gateway applies the same rule at boot to
+/// every config the platform did not render. Unparseable input fails closed.
+pub fn check_config_entitlements(
+    raw: &str,
+    claims: &mcpg_control_plane_license::license::LicenseClaims,
+) -> Result<(), PublishGuardError> {
+    let Some(cfg) = parse_structured(raw) else {
+        return Err(PublishGuardError {
+            violations: vec![Violation {
+                kind: "unparseable_config",
+                snippet: "config is not valid YAML or TOML".to_owned(),
+            }],
+        });
+    };
+    let violations: Vec<Violation> = licensed_config_surfaces(&cfg)
+        .into_iter()
+        .filter(|(feature, _)| !claims.has_feature(feature))
+        .map(|(feature, path)| Violation {
+            kind: "feature_not_licensed",
+            snippet: format!(
+                "{path} needs the `{feature}` license feature, which plan `{}` does not grant",
+                claims.plan
+            ),
+        })
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(PublishGuardError { violations })
+    }
+}
+
 /// Why a cloud publish was refused for lacking authentication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloudAuthError {
-    /// No token verifier (`governance.access.jwks` / `oidc_oauth`) is
-    /// configured and the tenant did not explicitly opt into an anonymous
-    /// gateway (`cloud.allow_anonymous: true`).
+    /// No token verifier (`governance.access.jwks` / `oidc_oauth` /
+    /// `authorization_server`) is configured and the tenant did not
+    /// explicitly opt into an anonymous gateway (`cloud.allow_anonymous: true`).
     NoVerifier,
     /// The config could not be parsed as YAML or TOML, so its auth posture
     /// can't be verified. Fail closed — an unparseable config wouldn't boot
@@ -411,8 +480,10 @@ impl fmt::Display for CloudAuthError {
                 f,
                 "cloud gateway requires a token verifier so its public endpoint isn't reachable \
                  with a self-asserted identity: set `governance.access.jwks` (or \
-                 `governance.access.oidc_oauth`) to your IdP. To intentionally publish a public / \
-                 anonymous MCP server, set `cloud.allow_anonymous: true`."
+                 `governance.access.oidc_oauth`) to your IdP, or configure the embedded \
+                 enterprise-managed authorization server (`governance.access.authorization_server`). \
+                 To intentionally publish a public / anonymous MCP server, set \
+                 `cloud.allow_anonymous: true`."
             ),
             Self::Unparseable => write!(
                 f,
@@ -428,9 +499,10 @@ impl std::error::Error for CloudAuthError {}
 /// Guard a **managed-cloud** publish: a gateway exposed on the public edge at
 /// `https://{subdomain}.<domain>/mcp` must not be reachable by a caller that
 /// merely asserts an identity header. The gateway only enforces verified auth
-/// when `governance.access.jwks` or `governance.access.oidc_oauth` is
-/// configured (mirrors the gateway's `AccessConfig::is_enabled`); with neither,
-/// the default trust floor admits self-asserted (`HeaderAsserted`) callers.
+/// when `governance.access.jwks`, `governance.access.oidc_oauth` or the
+/// embedded `governance.access.authorization_server` is configured (mirrors
+/// the gateway's `AccessConfig::is_enabled`); with none, the default trust
+/// floor admits self-asserted (`HeaderAsserted`) callers.
 ///
 /// So at publish time we require EITHER a configured verifier OR an explicit
 /// `cloud.allow_anonymous: true` opt-out (a deliberately public MCP server).
@@ -453,11 +525,14 @@ pub fn require_cloud_auth(raw: &str) -> Result<(), CloudAuthError> {
         return Ok(());
     }
 
-    // A configured verifier under `governance.access` — presence of either key
-    // as an object is exactly what flips the gateway's `is_enabled()` to true.
+    // A configured verifier under `governance.access` — presence of any of
+    // these keys as an object is exactly what flips the gateway's
+    // `is_enabled()` to true.
     let access = cfg.pointer("/governance/access");
     let has_verifier = access.is_some_and(|a| {
-        is_present_object(a.get("jwks")) || is_present_object(a.get("oidc_oauth"))
+        VERIFIER_KEYS
+            .iter()
+            .any(|key| is_present_object(a.get(*key)))
     });
 
     if has_verifier {
@@ -485,8 +560,9 @@ fn parse_structured(raw: &str) -> Option<serde_json::Value> {
 }
 
 /// True when `node` is present and a JSON object (matches the gateway treating
-/// `jwks: {}` / `oidc_oauth: {...}` as "auth enabled" — a present, non-null
-/// block). `null` / absent / scalar ⇒ not a verifier.
+/// `jwks: {}` / `oidc_oauth: {...}` / `authorization_server: {...}` as "auth
+/// enabled" — a present, non-null block). `null` / absent / scalar ⇒ not a
+/// verifier.
 fn is_present_object(node: Option<&serde_json::Value>) -> bool {
     matches!(node, Some(serde_json::Value::Object(_)))
 }
@@ -853,6 +929,136 @@ b: "aws-sm://prod/db-password""#;
                       client_id: "gw"
         "#;
         assert!(require_cloud_auth(cfg).is_ok());
+    }
+
+    /// The embedded enterprise-managed authorization server verifies the
+    /// tokens it mints, so it is a verifier on its own — no JWKS or OIDC
+    /// block and no anonymous opt-out needed.
+    #[test]
+    fn cloud_auth_allows_embedded_authorization_server() {
+        let cfg = r#"
+            governance:
+              access:
+                resource_metadata:
+                  resource: "https://edge-1.mcpg.cloud/mcp"
+                authorization_server:
+                  issuer: "https://edge-1.mcpg.cloud"
+                  signing_secret: "${secret.EMA_SIGNING_SECRET}"
+                  trusted_idps:
+                    - issuer: "https://acme.okta.com"
+                  clients:
+                    - client_id: "mcp-client"
+                      client_secret: "${secret.MCP_CLIENT_SECRET}"
+        "#;
+        assert!(require_cloud_auth(cfg).is_ok());
+        let toml_cfg = r#"
+[governance.access.authorization_server]
+issuer = "https://edge-1.mcpg.cloud"
+signing_secret = "${secret.EMA_SIGNING_SECRET}"
+"#;
+        assert!(require_cloud_auth(toml_cfg).is_ok());
+    }
+
+    /// Only a present block counts: an empty `access` map, a bare
+    /// `authorization_server:` (null) or a scalar is no verifier.
+    #[test]
+    fn cloud_auth_treats_an_absent_or_null_authorization_server_as_no_verifier() {
+        for cfg in [
+            "governance:\n  access: {}\n",
+            "governance:\n  access:\n    authorization_server:\n",
+            "governance:\n  access:\n    authorization_server: \"https://edge-1.mcpg.cloud\"\n",
+        ] {
+            assert_eq!(
+                require_cloud_auth(cfg),
+                Err(CloudAuthError::NoVerifier),
+                "{cfg}"
+            );
+        }
+    }
+
+    fn claims_for(plan: &str) -> mcpg_control_plane_license::license::LicenseClaims {
+        let mut claims = mcpg_control_plane_license::license::LicenseClaims::community("mcpg-cp");
+        claims.plan = plan.to_owned();
+        claims.features = mcpg_control_plane_license::license::features_for(plan);
+        claims
+    }
+
+    const LOGIN_CONFIG: &str = r#"
+governance:
+  access:
+    authorization_server:
+      issuer: "https://edge-1.mcpg.cloud"
+      trusted_idps:
+        - issuer: "https://acme.okta.com"
+          login:
+            client_id: "0oa1agent"
+            client_secret: "${secret.OKTA_CLIENT_SECRET}"
+        - issuer: "https://other.example.com"
+      interactive:
+        access_token_ttl_secs: 600
+"#;
+
+    /// Interactive sign-in is an enterprise feature: the login block and the
+    /// interactive block are each refused under a plan without it, and named.
+    #[test]
+    fn interactive_login_needs_the_enterprise_feature() {
+        for plan in ["community", "pro", "team"] {
+            let err = check_config_entitlements(LOGIN_CONFIG, &claims_for(plan)).expect_err(plan);
+            let snippets: Vec<&str> = err.violations.iter().map(|v| v.snippet.as_str()).collect();
+            assert_eq!(err.violations.len(), 2, "{plan}: {snippets:?}");
+            assert!(
+                err.violations
+                    .iter()
+                    .all(|v| v.kind == "feature_not_licensed"
+                        && v.snippet.contains("`sso.interactive_login`")
+                        && v.snippet.contains(&format!("plan `{plan}`"))),
+                "{snippets:?}"
+            );
+            assert!(snippets[0].starts_with(
+                "governance.access.authorization_server.trusted_idps[`https://acme.okta.com`].login"
+            ));
+            assert!(snippets[1].starts_with("governance.access.authorization_server.interactive"));
+        }
+        check_config_entitlements(LOGIN_CONFIG, &claims_for("enterprise"))
+            .expect("enterprise grants interactive login");
+    }
+
+    /// An EMA-only server, an absent or null block, and TOML all read the
+    /// same way; unparseable input fails closed.
+    #[test]
+    fn config_entitlements_see_only_present_blocks() {
+        let community = claims_for("community");
+        for clean in [
+            "gateway:\n  server:\n    bind_address: \"0.0.0.0:8787\"\n",
+            "governance:\n  access:\n    authorization_server:\n      issuer: https://x\n      trusted_idps:\n        - issuer: https://acme.okta.com\n",
+            "governance:\n  access:\n    authorization_server:\n      interactive:\n      trusted_idps:\n        - issuer: https://acme.okta.com\n          login:\n",
+        ] {
+            check_config_entitlements(clean, &community).expect(clean);
+        }
+        let toml_cfg = r#"
+[[governance.access.authorization_server.trusted_idps]]
+issuer = "https://acme.okta.com"
+[governance.access.authorization_server.trusted_idps.login]
+client_id = "agent"
+"#;
+        let err = check_config_entitlements(toml_cfg, &community).unwrap_err();
+        assert_eq!(err.violations.len(), 1, "{err}");
+        assert_eq!(
+            check_config_entitlements("just a string", &community)
+                .unwrap_err()
+                .violations[0]
+                .kind,
+            "unparseable_config"
+        );
+    }
+
+    #[test]
+    fn cloud_auth_error_names_every_verifier() {
+        let msg = CloudAuthError::NoVerifier.to_string();
+        for key in VERIFIER_KEYS {
+            assert!(msg.contains(&format!("governance.access.{key}")), "{msg}");
+        }
+        assert!(msg.contains("cloud.allow_anonymous: true"), "{msg}");
     }
 
     #[test]
