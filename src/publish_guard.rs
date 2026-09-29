@@ -37,7 +37,8 @@
 //!
 //! [`check_config_entitlements`] is the license half: a config block whose
 //! surface a plan feature withholds (interactive sign-in needs
-//! `sso.interactive_login`) is refused unless the org's claims grant it.
+//! `sso.interactive_login`, DPoP `oauth.dpop`, rich authorization requests
+//! `oauth.rich_authorization`) is refused unless the org's claims grant it.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -400,9 +401,13 @@ fn check_leaf_value(value: &str, secret_keys: &BTreeSet<String>, violations: &mu
 
 /// The config surfaces a license feature withholds, as
 /// `(feature, dotted path of the block that needs it)`. Only a present,
-/// non-null block counts, as with the verifier blocks.
+/// non-null block counts, as with the verifier blocks, and only when it turns
+/// its surface on, as the gateway reads it: `dpop` with `enabled: true` (a
+/// boolean), `authorization_details` with a non-empty `types` list.
 pub fn licensed_config_surfaces(cfg: &serde_json::Value) -> Vec<(&'static str, String)> {
-    use mcpg_control_plane_license::license::FEATURE_INTERACTIVE_LOGIN;
+    use mcpg_control_plane_license::license::{
+        FEATURE_DPOP, FEATURE_INTERACTIVE_LOGIN, FEATURE_RICH_AUTHORIZATION,
+    };
     const SERVER: &str = "governance.access.authorization_server";
     let mut surfaces = Vec::new();
     let Some(server) = cfg.pointer("/governance/access/authorization_server") else {
@@ -422,12 +427,26 @@ pub fn licensed_config_surfaces(cfg: &serde_json::Value) -> Vec<(&'static str, S
     if is_present_object(server.get("interactive")) {
         surfaces.push((FEATURE_INTERACTIVE_LOGIN, format!("{SERVER}.interactive")));
     }
+    if server.pointer("/dpop/enabled") == Some(&serde_json::Value::Bool(true)) {
+        surfaces.push((FEATURE_DPOP, format!("{SERVER}.dpop")));
+    }
+    if server
+        .pointer("/authorization_details/types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| !types.is_empty())
+    {
+        surfaces.push((
+            FEATURE_RICH_AUTHORIZATION,
+            format!("{SERVER}.authorization_details"),
+        ));
+    }
     surfaces
 }
 
 /// Refuse a published config that configures a surface the org's license
-/// does not grant: interactive sign-in at the embedded authorization server
-/// needs `sso.interactive_login`. Runs on the managed-cloud publish path
+/// does not grant at the embedded authorization server: interactive sign-in
+/// needs `sso.interactive_login`, DPoP `oauth.dpop` and rich authorization
+/// requests `oauth.rich_authorization`. Runs on the managed-cloud publish path
 /// with the org's live claims; the gateway applies the same rule at boot to
 /// every config the platform did not render. Unparseable input fails closed.
 pub fn check_config_entitlements(
@@ -1050,6 +1069,127 @@ client_id = "agent"
                 .kind,
             "unparseable_config"
         );
+    }
+
+    const CONSTRAINED_TOKENS_CONFIG: &str = r#"
+governance:
+  access:
+    authorization_server:
+      issuer: "https://edge-1.mcpg.cloud"
+      trusted_idps:
+        - issuer: "https://acme.okta.com"
+      dpop:
+        enabled: true
+        nonce: token_endpoint
+      authorization_details:
+        types:
+          - type: mcp_tool
+            actions: ["tools/call"]
+"#;
+
+    /// DPoP and rich authorization requests are enterprise features: each
+    /// turned-on block is refused under a plan without its feature, and
+    /// named with the feature and the plan.
+    #[test]
+    fn dpop_and_rich_authorization_need_the_enterprise_features() {
+        for plan in ["community", "pro", "team"] {
+            let err = check_config_entitlements(CONSTRAINED_TOKENS_CONFIG, &claims_for(plan))
+                .expect_err(plan);
+            let snippets: Vec<&str> = err.violations.iter().map(|v| v.snippet.as_str()).collect();
+            assert_eq!(err.violations.len(), 2, "{plan}: {snippets:?}");
+            assert!(
+                err.violations
+                    .iter()
+                    .all(|v| v.kind == "feature_not_licensed"
+                        && v.snippet.contains(&format!("plan `{plan}`"))),
+                "{snippets:?}"
+            );
+            assert_eq!(
+                snippets[0],
+                format!(
+                    "governance.access.authorization_server.dpop needs the `oauth.dpop` license \
+                     feature, which plan `{plan}` does not grant"
+                )
+            );
+            assert_eq!(
+                snippets[1],
+                format!(
+                    "governance.access.authorization_server.authorization_details needs the \
+                     `oauth.rich_authorization` license feature, which plan `{plan}` does not \
+                     grant"
+                )
+            );
+        }
+        check_config_entitlements(CONSTRAINED_TOKENS_CONFIG, &claims_for("enterprise"))
+            .expect("enterprise grants DPoP and rich authorization requests");
+    }
+
+    /// A block that leaves its surface off needs no feature: `dpop` without
+    /// `enabled: true`, `authorization_details` without a type. TOML reads
+    /// the same way.
+    #[test]
+    fn disabled_dpop_and_authorization_details_blocks_need_no_feature() {
+        let community = claims_for("community");
+        for clean in [
+            "governance:\n  access:\n    authorization_server:\n      dpop:\n        enabled: false\n        nonce: always\n        required: false\n",
+            "governance:\n  access:\n    authorization_server:\n      dpop: {}\n",
+            "governance:\n  access:\n    authorization_server:\n      dpop:\n",
+            "governance:\n  access:\n    authorization_server:\n      authorization_details:\n        max_entries: 8\n",
+            "governance:\n  access:\n    authorization_server:\n      authorization_details:\n        types: []\n",
+            "governance:\n  access:\n    authorization_server:\n      authorization_details:\n",
+        ] {
+            check_config_entitlements(clean, &community).expect(clean);
+        }
+        let toml_cfg = r#"
+[governance.access.authorization_server.dpop]
+enabled = true
+[[governance.access.authorization_server.authorization_details.types]]
+type = "mcp_tool"
+"#;
+        let err = check_config_entitlements(toml_cfg, &community).unwrap_err();
+        assert_eq!(err.violations.len(), 2, "{err}");
+        check_config_entitlements(
+            "[governance.access.authorization_server.dpop]\nenabled = false\n",
+            &community,
+        )
+        .expect("a TOML block that leaves DPoP off");
+    }
+
+    /// Interactive sign-in, DPoP and rich authorization requests on one
+    /// server are refused together, each by its own feature.
+    #[test]
+    fn one_refusal_names_every_authorization_server_feature() {
+        let every = format!(
+            "{LOGIN_CONFIG}      dpop:\n        enabled: true\n      authorization_details:\n        \
+             types:\n          - type: mcp_tool\n"
+        );
+        let err = check_config_entitlements(&every, &claims_for("team")).unwrap_err();
+        let features: Vec<&str> = err
+            .violations
+            .iter()
+            .map(|v| {
+                [
+                    "sso.interactive_login",
+                    "oauth.dpop",
+                    "oauth.rich_authorization",
+                ]
+                .into_iter()
+                .find(|f| v.snippet.contains(&format!("`{f}`")))
+                .unwrap_or("?")
+            })
+            .collect();
+        assert_eq!(
+            features,
+            [
+                "sso.interactive_login",
+                "sso.interactive_login",
+                "oauth.dpop",
+                "oauth.rich_authorization"
+            ],
+            "{err}"
+        );
+        check_config_entitlements(&every, &claims_for("enterprise"))
+            .expect("enterprise grants all three");
     }
 
     #[test]
