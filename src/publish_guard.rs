@@ -35,19 +35,35 @@
 //! schemes the tenant owns (`vault://`, `aws-sm://`) are likewise allowed; only
 //! the host-reading `env://` / `file://` schemes are blocked.
 //!
-//! [`check_config_entitlements`] is the license half: a config block whose
-//! surface a plan feature withholds (interactive sign-in needs
-//! `sso.interactive_login`, DPoP `oauth.dpop`, rich authorization requests
-//! `oauth.rich_authorization`) is refused unless the org's claims grant it.
+//! Licensing is the platform's on the managed service, so a `license:` block
+//! in a published config is refused outright: the org's claims come from the
+//! control plane, never from the config it admits.
+//!
+//! [`check_config_entitlements`] is the license half, read against the org's
+//! claims: a config block whose surface a plan feature withholds (interactive
+//! sign-in needs `sso.interactive_login`, DPoP `oauth.dpop`, rich
+//! authorization requests `oauth.rich_authorization`), a `plugins[]` entry the
+//! plan does not entitle, and — without `plugins.custom` — any plugin source
+//! outside the first-party registry or any registry or trust setting that
+//! could reach one. [`check_plugin_quota`] caps the entries at
+//! `quotas.plugins`, and [`check_event_type_quota`] the declared MCP Events
+//! types at `quotas.event_types`. Plugins the platform adds itself
+//! ([`PLATFORM_INJECTED_PLUGINS`]) are outside the quota, and pass the
+//! entitlement check where the licence admits them as the platform's, as the
+//! gateway's own gate does. What the platform accepts but replaces in the
+//! render is reported, not refused ([`managed_publish_warnings`]).
 
 use std::collections::BTreeSet;
 use std::fmt;
+
+use mcpg_control_plane_license::license::LicenseClaims;
 
 /// A single rejected construct, with enough context for a useful CLI/API error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
     /// Machine-stable kind (`host_env_interpolation`, `unregistered_secret`,
-    /// `host_secret_uri`, `malformed_cred_token`).
+    /// `host_secret_uri`, `malformed_cred_token`, `license_block`,
+    /// `feature_not_licensed`, `plugin_not_entitled`, `plugin_quota_exceeded`, …).
     pub kind: &'static str,
     /// The offending token / fragment (truncated), for the operator's message.
     pub snippet: String,
@@ -173,11 +189,101 @@ pub fn check_published_config_with_secret_keys(
         check_leaf_value(leaf, secret_keys, &mut violations)
     });
     check_ssrf(&cfg, &mut violations);
+    check_license_block(&cfg, &mut violations);
+    check_events(&cfg, &mut violations);
 
     if violations.is_empty() {
         Ok(())
     } else {
         Err(PublishGuardError { violations })
+    }
+}
+
+/// Refuse the MCP Events settings a managed gateway must not run with: a
+/// subscription that never expires, a subscriber trust floor below a
+/// verified principal, a callback proof other than the signed challenge
+/// (the allowlist and the receiver document trust what the tenant names),
+/// a callback port other than 443 (the managed egress opens 443 only), and
+/// an inbound source that accepts unsigned requests.
+fn check_events(cfg: &serde_json::Value, violations: &mut Vec<Violation>) {
+    const WEBHOOK: &str = "mcp.configurations.events.webhook";
+    let mut refuse = |kind: &'static str, snippet: String| {
+        violations.push(Violation { kind, snippet });
+    };
+    // Every delivery mode has its own floor, and each reaches subscribers.
+    for mode in ["webhook", "poll", "push"] {
+        if let Some(trust) = cfg
+            .pointer(&format!("/mcp/configurations/events/{mode}/require_trust"))
+            .and_then(|v| v.as_str())
+            && trust != "verified"
+        {
+            refuse(
+                "events_trust_floor",
+                format!(
+                    "mcp.configurations.events.{mode}.require_trust: {}",
+                    truncate(trust)
+                ),
+            );
+        }
+    }
+    if let Some(webhook) = cfg.pointer("/mcp/configurations/events/webhook") {
+        if webhook.pointer("/ttl/allow_no_expiry") == Some(&serde_json::Value::Bool(true)) {
+            refuse("events_no_expiry", format!("{WEBHOOK}.ttl.allow_no_expiry"));
+        }
+        if let Some(modes) = webhook
+            .pointer("/verification/modes")
+            .and_then(|v| v.as_array())
+        {
+            for mode in modes.iter().filter_map(|m| m.as_str()) {
+                if mode != "challenge" {
+                    refuse(
+                        "events_verification_mode",
+                        format!("{WEBHOOK}.verification.modes: {}", truncate(mode)),
+                    );
+                }
+            }
+        }
+        if let Some(ports) = webhook
+            .pointer("/egress/allowed_ports")
+            .and_then(|v| v.as_array())
+            && *ports != [serde_json::json!(443)]
+        {
+            refuse(
+                "events_callback_ports",
+                format!("{WEBHOOK}.egress.allowed_ports"),
+            );
+        }
+    }
+    if let Some(types) = cfg
+        .pointer("/mcp/capabilities/events")
+        .and_then(|v| v.as_array())
+    {
+        for (index, ty) in types.iter().enumerate() {
+            if ty.pointer("/source/inbound/allow_unsigned") == Some(&serde_json::Value::Bool(true))
+            {
+                let name = ty
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| format!("`{}`", truncate(n)))
+                    .unwrap_or_else(|| index.to_string());
+                refuse(
+                    "events_unsigned_inbound",
+                    format!("mcp.capabilities.events[{name}].source.inbound.allow_unsigned"),
+                );
+            }
+        }
+    }
+}
+
+/// Refuse a `license:` block. A token, a public key or `non_production_use`
+/// would give the gateway a licence answer the tenant chose; on the managed
+/// service the org's claims are the only one. A key with no value sets nothing.
+fn check_license_block(cfg: &serde_json::Value, violations: &mut Vec<Violation>) {
+    if cfg.get("license").is_some_and(|v| !v.is_null()) {
+        violations.push(Violation {
+            kind: "license_block",
+            snippet: "license".to_owned(),
+        });
     }
 }
 
@@ -406,10 +512,21 @@ fn check_leaf_value(value: &str, secret_keys: &BTreeSet<String>, violations: &mu
 /// boolean), `authorization_details` with a non-empty `types` list.
 pub fn licensed_config_surfaces(cfg: &serde_json::Value) -> Vec<(&'static str, String)> {
     use mcpg_control_plane_license::license::{
-        FEATURE_DPOP, FEATURE_INTERACTIVE_LOGIN, FEATURE_RICH_AUTHORIZATION,
+        FEATURE_DPOP, FEATURE_EVENTS_WEBHOOKS, FEATURE_INTERACTIVE_LOGIN,
+        FEATURE_RICH_AUTHORIZATION,
     };
     const SERVER: &str = "governance.access.authorization_server";
     let mut surfaces = Vec::new();
+    // Webhook delivery is on by default once events are enabled.
+    if let Some(events) = cfg.pointer("/mcp/configurations/events")
+        && events.get("enabled") == Some(&serde_json::Value::Bool(true))
+        && events.pointer("/webhook/enabled") != Some(&serde_json::Value::Bool(false))
+    {
+        surfaces.push((
+            FEATURE_EVENTS_WEBHOOKS,
+            "mcp.configurations.events.webhook".to_owned(),
+        ));
+    }
     let Some(server) = cfg.pointer("/governance/access/authorization_server") else {
         return surfaces;
     };
@@ -443,39 +560,344 @@ pub fn licensed_config_surfaces(cfg: &serde_json::Value) -> Vec<(&'static str, S
     surfaces
 }
 
-/// Refuse a published config that configures a surface the org's license
-/// does not grant at the embedded authorization server: interactive sign-in
-/// needs `sso.interactive_login`, DPoP `oauth.dpop` and rich authorization
-/// requests `oauth.rich_authorization`. Runs on the managed-cloud publish path
-/// with the org's live claims; the gateway applies the same rule at boot to
-/// every config the platform did not render. Unparseable input fails closed.
+/// Refuse a published config the org's license does not cover:
+///
+/// - a surface of the embedded authorization server a plan feature withholds
+///   (interactive sign-in needs `sso.interactive_login`, DPoP `oauth.dpop`,
+///   rich authorization requests `oauth.rich_authorization`);
+/// - a `plugins[]` entry whose `id` or `ref`
+///   [`plugin_load_violation`](mcpg_control_plane_license::license::plugin_load_violation)
+///   refuses — `plugin_not_entitled` outside the plan's envelope,
+///   `feature_not_licensed` for a plugin whose feature the plan lacks — other
+///   than the platform's coordinator under a licence that admits it
+///   ([`admits_platform_coordinator`](mcpg_control_plane_license::license::admits_platform_coordinator));
+/// - without `plugins.custom`, every plugin source outside the first-party
+///   registry and every registry or trust setting that could reach one
+///   ([`custom_plugin_surfaces`]).
+///
+/// Runs on the managed-cloud publish path with the org's live claims; the
+/// gateway applies the authorization-server rule at boot to every config the
+/// platform did not render. Unparseable input fails closed.
 pub fn check_config_entitlements(
     raw: &str,
-    claims: &mcpg_control_plane_license::license::LicenseClaims,
+    claims: &LicenseClaims,
 ) -> Result<(), PublishGuardError> {
     let Some(cfg) = parse_structured(raw) else {
-        return Err(PublishGuardError {
-            violations: vec![Violation {
-                kind: "unparseable_config",
-                snippet: "config is not valid YAML or TOML".to_owned(),
-            }],
-        });
+        return Err(unparseable());
     };
-    let violations: Vec<Violation> = licensed_config_surfaces(&cfg)
+    let mut violations: Vec<Violation> = licensed_config_surfaces(&cfg)
         .into_iter()
         .filter(|(feature, _)| !claims.has_feature(feature))
         .map(|(feature, path)| Violation {
             kind: "feature_not_licensed",
-            snippet: format!(
-                "{path} needs the `{feature}` license feature, which plan `{}` does not grant",
-                claims.plan
-            ),
+            snippet: not_granted(&path, feature, &claims.plan),
         })
         .collect();
+    check_plugin_entitlements(&cfg, claims, &mut violations);
+    if !allows_custom_plugins(claims) {
+        use mcpg_control_plane_license::license::FEATURE_CUSTOM_PLUGINS;
+        violations.extend(
+            custom_plugin_surfaces(&cfg)
+                .into_iter()
+                .map(|path| Violation {
+                    kind: "feature_not_licensed",
+                    snippet: not_granted(&path, FEATURE_CUSTOM_PLUGINS, &claims.plan),
+                }),
+        );
+    }
     if violations.is_empty() {
         Ok(())
     } else {
         Err(PublishGuardError { violations })
+    }
+}
+
+/// Refuse a published config that lists more `plugins[]` entries than
+/// `quotas.plugins` (`0` is unlimited). The quota also caps a workspace's
+/// plugin sets; however it is summed, one config above it is over it. An
+/// entry that loads one of the [`PLATFORM_INJECTED_PLUGINS`] is not counted;
+/// one that only borrows its name as an alias is. Unparseable input fails
+/// closed.
+pub fn check_plugin_quota(raw: &str, claims: &LicenseClaims) -> Result<(), PublishGuardError> {
+    let Some(cfg) = parse_structured(raw) else {
+        return Err(unparseable());
+    };
+    let limit = claims.quotas.plugins;
+    let listed = cfg
+        .get("plugins")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|e| !loads_platform_injected_plugin(e))
+                .count()
+        }) as u64;
+    if limit == 0 || listed <= limit {
+        return Ok(());
+    }
+    Err(PublishGuardError {
+        violations: vec![Violation {
+            kind: "plugin_quota_exceeded",
+            snippet: format!(
+                "plugins lists {listed} entries and plan `{}` includes {limit}",
+                claims.plan
+            ),
+        }],
+    })
+}
+
+/// Refuse a published config that declares more MCP Events types under
+/// `mcp.capabilities.events` than the plan serves (`event_types`, `0` is
+/// unlimited). Imported types are not in the config; the gateway serves
+/// those within what the declared ones leave. Unparseable input fails
+/// closed.
+pub fn check_event_type_quota(raw: &str, claims: &LicenseClaims) -> Result<(), PublishGuardError> {
+    let Some(cfg) = parse_structured(raw) else {
+        return Err(unparseable());
+    };
+    let limit = claims.quotas.event_types_for(&claims.plan);
+    let declared = cfg
+        .pointer("/mcp/capabilities/events")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len) as u64;
+    if limit == 0 || declared <= limit {
+        return Ok(());
+    }
+    Err(PublishGuardError {
+        violations: vec![Violation {
+            kind: "event_type_quota_exceeded",
+            snippet: format!(
+                "mcp.capabilities.events declares {declared} event types and plan `{}` serves {limit}",
+                claims.plan
+            ),
+        }],
+    })
+}
+
+/// Whether `claims` admit plugins the customer publishes themselves, and the
+/// registry and trust settings that reach them. The plan counts as well as
+/// the flag, so a licence pinned before `plugins.custom` joined its plan keeps
+/// what the plan sold.
+pub fn allows_custom_plugins(claims: &LicenseClaims) -> bool {
+    use mcpg_control_plane_license::license::FEATURE_CUSTOM_PLUGINS;
+    claims.has_feature(FEATURE_CUSTOM_PLUGINS)
+        || mcpg_control_plane_license::license::allows_custom_plugins(&claims.plan)
+}
+
+/// The signature policy every managed gateway runs by default: the managed
+/// render sets it whatever the published config says, so an artefact loads
+/// only when a trusted key signed it.
+pub const MANAGED_SIGNATURE_POLICY: &str = "enforce";
+
+/// `gateway.plugin_registry` keys that never change where an artefact comes
+/// from or which key vouches for it, so every plan may set them. The default
+/// signature policy is among them because the managed render replaces it
+/// with [`MANAGED_SIGNATURE_POLICY`].
+const REGISTRY_KEYS_ANY_PLAN: [&str; 4] = [
+    "cache_dir",
+    "revocation_list_path",
+    "require_integrity_anchor",
+    "default_signature_policy",
+];
+
+/// Every place a config reaches a plugin the platform did not publish, as a
+/// dotted path: a `source.oci` outside the first-party registry, a per-entry
+/// `signature.trusted_keys`, a per-entry `signature.policy` other than
+/// [`MANAGED_SIGNATURE_POLICY`] (it would load an artefact no trusted key
+/// signed), and any `gateway.plugin_registry` key beyond
+/// [`REGISTRY_KEYS_ANY_PLAN`] (a mirror, a default registry, trusted keys,
+/// credentials, TLS, a plain-HTTP registry). A key present with no value —
+/// null, `[]` or `{}` — sets nothing and is not listed. A `source.path` names
+/// a file in the image, which [`crate::target_validate`] checks against the
+/// release.
+pub fn custom_plugin_surfaces(cfg: &serde_json::Value) -> Vec<String> {
+    use crate::target_validate::is_first_party_plugin_ref;
+    let mut surfaces = Vec::new();
+    if let Some(registry) = cfg
+        .pointer("/gateway/plugin_registry")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in registry {
+            if !REGISTRY_KEYS_ANY_PLAN.contains(&key.as_str()) && sets_something(value) {
+                surfaces.push(format!("gateway.plugin_registry.{key}"));
+            }
+        }
+    }
+    let Some(entries) = cfg.get("plugins").and_then(serde_json::Value::as_array) else {
+        return surfaces;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(oci) = entry.pointer("/source/oci").and_then(|v| v.as_str())
+            && !is_first_party_plugin_ref(oci)
+        {
+            surfaces.push(format!("plugins[{index}].source.oci `{}`", truncate(oci)));
+        }
+        if entry
+            .pointer("/signature/trusted_keys")
+            .is_some_and(sets_something)
+        {
+            surfaces.push(format!("plugins[{index}].signature.trusted_keys"));
+        }
+        if let Some(policy) = entry
+            .pointer("/signature/policy")
+            .filter(|v| sets_something(v))
+            .filter(|v| v.as_str() != Some(MANAGED_SIGNATURE_POLICY))
+        {
+            let shown = policy
+                .as_str()
+                .map_or_else(|| policy.to_string(), str::to_owned);
+            surfaces.push(format!(
+                "plugins[{index}].signature.policy `{}`",
+                truncate(&shown)
+            ));
+        }
+    }
+    surfaces
+}
+
+/// Plugins the managed platform adds to a render itself: the coordinator
+/// behind the `cluster` block it renders for an instance with more than one
+/// replica. The platform, not the tenant's plan, decides that they run, so
+/// they are outside the tenant's plugin quota; without the platform's
+/// `cluster` block nothing selects them. Whether a licence admits one is the
+/// gateway's rule, [`admits_platform_coordinator`], which the entitlement
+/// check applies too: a config the publish admits must load.
+///
+/// [`admits_platform_coordinator`]: mcpg_control_plane_license::license::admits_platform_coordinator
+pub const PLATFORM_INJECTED_PLUGINS: [&str; 1] =
+    [mcpg_control_plane_license::license::PLATFORM_COORDINATOR_PLUGIN];
+
+/// Whether `plugin` is one of [`PLATFORM_INJECTED_PLUGINS`].
+pub fn is_platform_injected_plugin(plugin: &str) -> bool {
+    PLATFORM_INJECTED_PLUGINS.contains(&plugin)
+}
+
+/// Whether a `plugins[]` entry loads a platform-injected plugin: its manifest
+/// id — the `ref`, else the `id` — is one of them. With a `ref`, the `id` is
+/// only an alias, and the gateway loads the artefact the `ref` names.
+fn loads_platform_injected_plugin(entry: &serde_json::Value) -> bool {
+    entry
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| entry.get("id").and_then(serde_json::Value::as_str))
+        .is_some_and(is_platform_injected_plugin)
+}
+
+/// Run [`plugin_load_violation`] over every `plugins[]` entry's `id` and,
+/// when it differs, its `ref`, except the platform's coordinator where the
+/// licence admits it as such ([`admits_platform_coordinator`]).
+/// Disabled entries are checked too, so the verdict never rests on the
+/// gateway honouring the flag. A tenant `cluster` block names no plugin: the
+/// managed render replaces it ([`managed_publish_warnings`]).
+///
+/// [`plugin_load_violation`]: mcpg_control_plane_license::license::plugin_load_violation
+/// [`admits_platform_coordinator`]: mcpg_control_plane_license::license::admits_platform_coordinator
+fn check_plugin_entitlements(
+    cfg: &serde_json::Value,
+    claims: &LicenseClaims,
+    violations: &mut Vec<Violation>,
+) {
+    let Some(entries) = cfg.get("plugins").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let id = entry.get("id").and_then(serde_json::Value::as_str);
+        let reference = entry
+            .get("ref")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| Some(*r) != id);
+        let named = [
+            (format!("plugins[{index}]"), id),
+            (format!("plugins[{index}].ref"), reference),
+        ];
+        for (at, plugin) in named {
+            if let Some(plugin) = plugin.filter(|p| {
+                !mcpg_control_plane_license::license::admits_platform_coordinator(claims, p)
+            }) {
+                check_plugin(claims, &at, plugin, violations);
+            }
+        }
+    }
+}
+
+/// What a managed publish accepts but does not run as written, one sentence
+/// each, for the publish answer. The platform owns the `cluster` block — it
+/// renders its own coordinator for an instance with more than one replica
+/// and none for one — and renders `gateway.plugin_registry.
+/// default_signature_policy` as [`MANAGED_SIGNATURE_POLICY`]. Empty for a
+/// config that sets nothing the platform replaces, and for one that does not
+/// parse (the guards refuse that).
+pub fn managed_publish_warnings(raw: &str) -> Vec<String> {
+    let Some(cfg) = parse_structured(raw) else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if cfg.get("cluster").is_some_and(sets_something) {
+        warnings.push(
+            "`cluster` is ignored: on the managed service the platform owns clustering and \
+             supplies the coordinator of an instance with more than one replica"
+                .to_owned(),
+        );
+    }
+    if let Some(policy) = cfg
+        .pointer("/gateway/plugin_registry/default_signature_policy")
+        .filter(|v| sets_something(v))
+        .filter(|v| v.as_str() != Some(MANAGED_SIGNATURE_POLICY))
+    {
+        let shown = policy
+            .as_str()
+            .map_or_else(|| policy.to_string(), str::to_owned);
+        warnings.push(format!(
+            "`gateway.plugin_registry.default_signature_policy: {}` is ignored: managed \
+             gateways verify plugin signatures (`{MANAGED_SIGNATURE_POLICY}`)",
+            truncate(&shown)
+        ));
+    }
+    warnings
+}
+
+/// Record why `claims` may not load `plugin`, named at config path `at`.
+fn check_plugin(claims: &LicenseClaims, at: &str, plugin: &str, violations: &mut Vec<Violation>) {
+    use mcpg_control_plane_license::license::{LicenseError, plugin_load_violation};
+    let at = format!("{at} `{}`", truncate(plugin));
+    match plugin_load_violation(claims, plugin) {
+        None => {}
+        Some(LicenseError::FeatureNotLicensed { feature, .. }) => {
+            violations.push(Violation {
+                kind: "feature_not_licensed",
+                snippet: not_granted(&at, &feature, &claims.plan),
+            });
+        }
+        Some(_) => violations.push(Violation {
+            kind: "plugin_not_entitled",
+            snippet: format!(
+                "{at} is not among the plugins plan `{}` entitles",
+                claims.plan
+            ),
+        }),
+    }
+}
+
+/// Whether a config value turns something on: anything but null, `[]` or `{}`.
+fn sets_something(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+fn not_granted(path: &str, feature: &str, plan: &str) -> String {
+    format!("{path} needs the `{feature}` license feature, which plan `{plan}` does not grant")
+}
+
+fn unparseable() -> PublishGuardError {
+    PublishGuardError {
+        violations: vec![Violation {
+            kind: "unparseable_config",
+            snippet: "config is not valid YAML or TOML".to_owned(),
+        }],
     }
 }
 
@@ -995,11 +1417,565 @@ signing_secret = "${secret.EMA_SIGNING_SECRET}"
         }
     }
 
-    fn claims_for(plan: &str) -> mcpg_control_plane_license::license::LicenseClaims {
-        let mut claims = mcpg_control_plane_license::license::LicenseClaims::community("mcpg-cp");
+    fn claims_for(plan: &str) -> LicenseClaims {
+        let mut claims = LicenseClaims::community("mcpg-cp");
+        let (entitlements, quotas) = mcpg_control_plane_license::license::plan_envelope(plan);
         claims.plan = plan.to_owned();
+        claims.plugin_entitlements = entitlements;
+        claims.quotas = quotas;
         claims.features = mcpg_control_plane_license::license::features_for(plan);
         claims
+    }
+
+    /// A managed gateway runs MCP Events only with expiring subscriptions,
+    /// verified subscribers, the signed challenge, callbacks on 443 and
+    /// signed inbound sources.
+    #[test]
+    fn refuses_the_events_settings_a_managed_gateway_must_not_run() {
+        let cfg = r#"
+mcp:
+  configurations:
+    events:
+      enabled: true
+      webhook:
+        require_trust: header_asserted
+        ttl: { allow_no_expiry: true }
+        verification: { modes: [challenge, allowlist, well_known], allowlist: [hooks.example.com] }
+        egress: { allowed_ports: [443, 8443] }
+      poll: { require_trust: header_asserted }
+      push: { require_trust: header_asserted }
+  capabilities:
+    events:
+      - name: orders.created
+        source: { inbound: { source_id: orders, allow_unsigned: true } }
+"#;
+        let err = check_published_config(cfg).unwrap_err();
+        let kinds: Vec<&str> = found(&err).iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                "events_callback_ports",
+                "events_no_expiry",
+                "events_trust_floor",
+                "events_trust_floor",
+                "events_trust_floor",
+                "events_unsigned_inbound",
+                "events_verification_mode",
+                "events_verification_mode",
+            ]
+        );
+        assert!(
+            found(&err)
+                .iter()
+                .any(|(_, s)| s.contains("events[`orders.created`]"))
+        );
+        for mode in ["webhook", "poll", "push"] {
+            assert!(
+                found(&err)
+                    .iter()
+                    .any(|(_, s)| s.contains(&format!("events.{mode}.require_trust"))),
+                "{mode}"
+            );
+        }
+
+        let fine = r#"
+mcp:
+  configurations:
+    events:
+      enabled: true
+      webhook:
+        require_trust: verified
+        verification: { modes: [challenge] }
+        egress: { allowed_ports: [443] }
+  capabilities:
+    events:
+      - name: orders.created
+        source: { inbound: { source_id: orders, verify: { profile: standard_webhooks, secrets: ["${secret.SHOP}"] } } }
+"#;
+        check_published_config_with_secret_keys(fine, &BTreeSet::from(["SHOP".to_owned()]))
+            .expect("the managed shape");
+    }
+
+    /// MCP Events webhook delivery needs `events.webhooks`, which every plan
+    /// carries; a licence without it is refused, and events with webhook
+    /// delivery off need nothing.
+    #[test]
+    fn webhook_delivery_needs_its_feature() {
+        use mcpg_control_plane_license::license::FEATURE_EVENTS_WEBHOOKS;
+        let on = "mcp:\n  configurations:\n    events:\n      enabled: true\n";
+        let off = "mcp:\n  configurations:\n    events:\n      enabled: true\n      webhook: { enabled: false }\n";
+        for plan in ["community", "pro", "team", "enterprise"] {
+            check_config_entitlements(on, &claims_for(plan)).expect(plan);
+        }
+        let mut without = claims_for("pro");
+        without.features.retain(|f| f != FEATURE_EVENTS_WEBHOOKS);
+        let err = check_config_entitlements(on, &without).unwrap_err();
+        assert_eq!(err.violations.len(), 1);
+        assert_eq!(err.violations[0].kind, "feature_not_licensed");
+        assert!(
+            err.violations[0]
+                .snippet
+                .contains("mcp.configurations.events.webhook")
+        );
+        check_config_entitlements(off, &without).expect("webhook delivery off");
+    }
+
+    /// `(kind, snippet)` of every violation, sorted: collection order follows
+    /// map iteration and is not part of the contract.
+    fn found(err: &PublishGuardError) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = err
+            .violations
+            .iter()
+            .map(|v| (v.kind, v.snippet.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A tenant `license:` block is refused whatever it holds; a key with no
+    /// value sets nothing and passes. TOML reads the same way.
+    #[test]
+    fn refuses_a_tenant_license_block() {
+        for cfg in [
+            "license:\n  non_production_use: true\n",
+            "license:\n  token: \"eyJhbGciOiJFZERTQSJ9.e30.sig\"\n  pubkey_pem: \"-----BEGIN PUBLIC KEY-----\"\n",
+            "license: {}\n",
+            "[license]\nnon_production_use = true\n",
+        ] {
+            let err = check_published_config(cfg).expect_err(cfg);
+            assert_eq!(
+                err.violations,
+                vec![Violation {
+                    kind: "license_block",
+                    snippet: "license".to_owned(),
+                }],
+                "{cfg}"
+            );
+        }
+        check_published_config(
+            "license:\ngateway:\n  server:\n    bind_address: \"0.0.0.0:8787\"\n",
+        )
+        .expect("a license key with no value");
+    }
+
+    /// One first-party OCI entry per plugin id: `(id, short name)`.
+    fn plugins_config(entries: &[(&str, &str)]) -> String {
+        let mut cfg = String::from("plugins:\n");
+        for (id, short) in entries {
+            cfg.push_str(&format!(
+                "  - id: {id}\n    source:\n      oci: ghcr.io/mcpg-dev/plugins/{short}:1.0.0\n"
+            ));
+        }
+        cfg
+    }
+
+    /// A paid-namespace plugin is outside a lower plan's envelope, and a
+    /// feature-gated one needs its feature; a free plugin passes everywhere,
+    /// and a disabled entry is checked like any other.
+    #[test]
+    fn plugin_entitlements_follow_the_plan() {
+        let cfg = format!(
+            "{}    disabled: true\n",
+            plugins_config(&[
+                ("dev.mcpg.backend.http", "backend-http"),
+                ("dev.mcpg.policy.casbin", "policy-casbin"),
+                ("dev.mcpg.identity.saml", "identity-saml"),
+                ("dev.mcpg.payment.acp", "payment-acp"),
+                ("dev.mcpg.cluster.redis", "cluster-redis"),
+            ])
+        );
+        let casbin = (
+            "plugin_not_entitled",
+            "plugins[1] `dev.mcpg.policy.casbin` is not among the plugins plan `{plan}` entitles",
+        );
+        let saml = (
+            "feature_not_licensed",
+            "plugins[2] `dev.mcpg.identity.saml` needs the `sso.saml` license feature, which \
+             plan `{plan}` does not grant",
+        );
+        let payment = (
+            "plugin_not_entitled",
+            "plugins[3] `dev.mcpg.payment.acp` is not among the plugins plan `{plan}` entitles",
+        );
+        let redis = (
+            "plugin_not_entitled",
+            "plugins[4] `dev.mcpg.cluster.redis` is not among the plugins plan `{plan}` entitles",
+        );
+        for (plan, expected) in [
+            ("community", vec![casbin, saml, payment, redis]),
+            ("pro", vec![casbin, saml, redis]),
+            ("team", vec![redis]),
+        ] {
+            let err = check_config_entitlements(&cfg, &claims_for(plan)).expect_err(plan);
+            let mut want: Vec<(&'static str, String)> = expected
+                .into_iter()
+                .map(|(kind, snippet)| (kind, snippet.replace("{plan}", plan)))
+                .collect();
+            want.sort();
+            assert_eq!(found(&err), want, "{plan}");
+        }
+        check_config_entitlements(&cfg, &claims_for("enterprise")).expect("enterprise");
+        let toml_cfg = "[[plugins]]\nid = \"dev.mcpg.policy.casbin\"\n\
+                        [plugins.source]\noci = \"ghcr.io/mcpg-dev/plugins/policy-casbin:1.0.0\"\n";
+        let err = check_config_entitlements(toml_cfg, &claims_for("community")).unwrap_err();
+        assert_eq!(err.violations[0].kind, "plugin_not_entitled", "{err}");
+    }
+
+    /// The `ref` names the artefact the gateway loads, so it is checked as
+    /// well as the alias — once when the two agree.
+    #[test]
+    fn plugin_entitlements_read_the_ref() {
+        let community = claims_for("community");
+        let aliased = "plugins:\n  - id: pay\n    ref: dev.mcpg.payment.acp\n    source:\n      \
+                       oci: ghcr.io/mcpg-dev/plugins/payment-acp:1.0.0\n";
+        let err = check_config_entitlements(aliased, &community).unwrap_err();
+        assert_eq!(
+            found(&err),
+            vec![(
+                "plugin_not_entitled",
+                "plugins[0].ref `dev.mcpg.payment.acp` is not among the plugins plan \
+                 `community` entitles"
+                    .to_owned()
+            )]
+        );
+        let same = aliased.replace("id: pay", "id: dev.mcpg.payment.acp");
+        let err = check_config_entitlements(&same, &community).unwrap_err();
+        assert_eq!(err.violations.len(), 1, "{err}");
+        assert!(
+            err.violations[0].snippet.starts_with("plugins[0] "),
+            "{err}"
+        );
+    }
+
+    /// The platform owns the `cluster` block on the managed service: a tenant
+    /// one names no plugin and is not refused on any plan, and the publish
+    /// answer says it is ignored. A config without one, or with an empty one,
+    /// draws no warning.
+    #[test]
+    fn a_tenant_cluster_block_is_ignored_with_a_warning() {
+        let redis = "cluster:\n  kind: redis\n  url: \"${secret.REDIS_URL}\"\n  \
+                     allow_plaintext_state: true\n";
+        for plan in ["community", "pro", "team", "enterprise"] {
+            check_config_entitlements(redis, &claims_for(plan)).expect(plan);
+            check_config_entitlements("cluster:\n  kind: nats\n", &claims_for(plan)).expect(plan);
+        }
+        let warnings = managed_publish_warnings(redis);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("`cluster` is ignored"),
+            "{warnings:?}"
+        );
+        for quiet in [
+            "gateway: {}\n",
+            "cluster: {}\n",
+            "cluster:\n",
+            "not: [valid",
+        ] {
+            assert!(managed_publish_warnings(quiet).is_empty(), "{quiet}");
+        }
+    }
+
+    /// The coordinator the platform injects for an instance with more than
+    /// one replica passes where the licence admits it as the platform's — the
+    /// rule the gateway's own gate applies, so what the publish admits loads —
+    /// under its `id` or its `ref`; another cluster coordinator does not, and
+    /// neither does it under a licence without that admission.
+    #[test]
+    fn a_platform_injected_plugin_is_exempt_from_the_plan() {
+        use mcpg_control_plane_license::license::FEATURE_PLATFORM_COORDINATION;
+        let nats = plugins_config(&[("dev.mcpg.cluster.nats", "cluster-nats")]);
+        let aliased = "plugins:\n  - id: coordinator\n    ref: dev.mcpg.cluster.nats\n    \
+                       source:\n      oci: ghcr.io/mcpg-dev/plugins/cluster-nats:1.0.0\n";
+        let redis = plugins_config(&[("dev.mcpg.cluster.redis", "cluster-redis")]);
+        for plan in ["community", "pro"] {
+            let mut managed = claims_for(plan);
+            managed.features.push(FEATURE_PLATFORM_COORDINATION.into());
+            check_config_entitlements(&nats, &managed).expect(plan);
+            check_config_entitlements(aliased, &managed).expect(plan);
+            let err = check_config_entitlements(&redis, &managed).expect_err(plan);
+            assert_eq!(err.violations[0].kind, "plugin_not_entitled", "{err}");
+
+            for cfg in [nats.as_str(), aliased] {
+                let err = check_config_entitlements(cfg, &claims_for(plan)).expect_err(plan);
+                assert_eq!(
+                    err.violations[0].kind, "plugin_not_entitled",
+                    "{plan}: {err}"
+                );
+            }
+        }
+        let mut one = claims_for("community");
+        one.quotas.plugins = 1;
+        let two = plugins_config(&[
+            ("dev.mcpg.backend.http", "backend-http"),
+            ("dev.mcpg.cluster.nats", "cluster-nats"),
+        ]);
+        check_plugin_quota(&two, &one).expect("the injected coordinator is not counted");
+        let over = plugins_config(&[
+            ("dev.mcpg.backend.http", "backend-http"),
+            ("dev.mcpg.backend.mock", "backend-mock"),
+        ]);
+        check_plugin_quota(&over, &one).expect_err("two tenant plugins over a quota of one");
+    }
+
+    /// The quota exemption follows the artefact an entry loads, not its
+    /// alias: the coordinator's id over another plugin's `ref` loads that
+    /// plugin and counts, and an alias over the coordinator's `ref` does not.
+    #[test]
+    fn the_coordinators_name_as_an_alias_does_not_exempt_another_plugin() {
+        let mut one = claims_for("community");
+        one.quotas.plugins = 1;
+        let masked = format!(
+            "{}  - id: dev.mcpg.cluster.nats\n    ref: dev.mcpg.backend.mock\n    \
+             source:\n      oci: ghcr.io/mcpg-dev/plugins/backend-mock:1.0.0\n",
+            plugins_config(&[("dev.mcpg.backend.http", "backend-http")])
+        );
+        let err = check_plugin_quota(&masked, &one).expect_err("backend.mock loads and counts");
+        assert_eq!(err.violations[0].kind, "plugin_quota_exceeded", "{err}");
+
+        let aliased = format!(
+            "{}  - id: coordinator\n    ref: dev.mcpg.cluster.nats\n    \
+             source:\n      oci: ghcr.io/mcpg-dev/plugins/cluster-nats:1.0.0\n",
+            plugins_config(&[("dev.mcpg.backend.http", "backend-http")])
+        );
+        check_plugin_quota(&aliased, &one).expect("the coordinator under an alias is not counted");
+    }
+
+    const CUSTOM_PLUGIN_CONFIG: &str = r#"
+gateway:
+  plugin_registry:
+    cache_dir: /var/lib/mcpg/plugin-cache
+    default_registry: registry.example.com/plugins
+    mirrors:
+      - url: registry.example.com/mirror
+    trusted_keys:
+      - id: acme
+        pem: "-----BEGIN PUBLIC KEY-----"
+    insecure_registries: ["registry.example.com"]
+    auth:
+      username: acme
+    tls:
+      insecure: true
+plugins:
+  - id: acme.tool
+    class: tool_gate
+    source:
+      oci: registry.example.com/plugins/acme-tool:1.0.0
+  - id: dev.mcpg.backend.http
+    source:
+      oci: ghcr.io/mcpg-dev/plugins/backend-http:1.0.0
+    signature:
+      trusted_keys:
+        - id: acme
+          pem: "-----BEGIN PUBLIC KEY-----"
+"#;
+
+    /// Without `plugins.custom`, every source outside the first-party
+    /// registry and every registry or trust setting that could reach one is
+    /// refused and named; enterprise may set them all.
+    #[test]
+    fn registry_and_trust_overrides_need_custom_plugins() {
+        for plan in ["community", "pro", "team"] {
+            let err =
+                check_config_entitlements(CUSTOM_PLUGIN_CONFIG, &claims_for(plan)).expect_err(plan);
+            let mut want: Vec<(&'static str, String)> = [
+                "gateway.plugin_registry.auth",
+                "gateway.plugin_registry.default_registry",
+                "gateway.plugin_registry.insecure_registries",
+                "gateway.plugin_registry.mirrors",
+                "gateway.plugin_registry.tls",
+                "gateway.plugin_registry.trusted_keys",
+                "plugins[0].source.oci `registry.example.com/plugins/acme-tool:1.0.0`",
+                "plugins[1].signature.trusted_keys",
+            ]
+            .into_iter()
+            .map(|path| {
+                (
+                    "feature_not_licensed",
+                    format!(
+                        "{path} needs the `plugins.custom` license feature, which plan `{plan}` \
+                         does not grant"
+                    ),
+                )
+            })
+            .collect();
+            want.sort();
+            assert_eq!(found(&err), want, "{plan}");
+        }
+        check_config_entitlements(CUSTOM_PLUGIN_CONFIG, &claims_for("enterprise"))
+            .expect("enterprise references its own plugins");
+    }
+
+    /// Settings that cannot reach a plugin the platform did not publish pass
+    /// on every plan: the cache and revocation paths, a stricter integrity
+    /// rule, a default signature policy (the managed render replaces it), a
+    /// per-entry policy of `enforce`, a hash pin, and keys with no value.
+    #[test]
+    fn registry_settings_that_reach_no_custom_plugin_pass_on_every_plan() {
+        let cfg = r#"
+gateway:
+  plugin_registry:
+    cache_dir: /var/lib/mcpg/plugin-cache
+    revocation_list_path: /etc/mcpg/revoked.json
+    require_integrity_anchor: true
+    default_signature_policy: disabled
+    mirrors: []
+    trusted_keys: []
+    auth: {}
+    tls:
+plugins:
+  - id: dev.mcpg.backend.http
+    source:
+      oci: oci://ghcr.io/mcpg-dev/plugins/backend-http:1.0.0
+    signature:
+      policy: enforce
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      trusted_keys: []
+  - id: dev.mcpg.backend.mock
+    source:
+      path: /usr/local/lib/mcpg/plugins/dev.mcpg.backend.mock/plugin.so
+"#;
+        for plan in ["community", "pro", "team", "enterprise"] {
+            check_config_entitlements(cfg, &claims_for(plan)).expect(plan);
+        }
+    }
+
+    /// A per-entry signature policy weaker than the managed default would
+    /// load an artefact no trusted key signed, so without `plugins.custom` it
+    /// is refused and named; `enforce` passes everywhere and enterprise may
+    /// relax it. The default policy is never refused: the publish answer
+    /// says the managed render replaces it.
+    #[test]
+    fn a_per_plugin_signature_policy_below_enforce_needs_custom_plugins() {
+        let with_policy = |policy: &str| {
+            format!(
+                "{}    signature:\n      policy: {policy}\n",
+                plugins_config(&[("dev.mcpg.backend.http", "backend-http")])
+            )
+        };
+        for plan in ["community", "pro", "team"] {
+            for policy in ["disabled", "warn"] {
+                let err = check_config_entitlements(&with_policy(policy), &claims_for(plan))
+                    .expect_err(plan);
+                assert_eq!(
+                    found(&err),
+                    vec![(
+                        "feature_not_licensed",
+                        format!(
+                            "plugins[0].signature.policy `{policy}` needs the `plugins.custom` \
+                             license feature, which plan `{plan}` does not grant"
+                        )
+                    )],
+                    "{plan} {policy}"
+                );
+            }
+            check_config_entitlements(&with_policy("enforce"), &claims_for(plan)).expect(plan);
+        }
+        check_config_entitlements(&with_policy("disabled"), &claims_for("enterprise"))
+            .expect("enterprise relaxes a plugin it vouches for itself");
+
+        let relaxed = "gateway:\n  plugin_registry:\n    default_signature_policy: disabled\n";
+        check_config_entitlements(relaxed, &claims_for("community")).expect("never refused");
+        let warnings = managed_publish_warnings(relaxed);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "`gateway.plugin_registry.default_signature_policy: disabled` is ignored"
+            ),
+            "{warnings:?}"
+        );
+        let strict = "gateway:\n  plugin_registry:\n    default_signature_policy: enforce\n";
+        assert!(managed_publish_warnings(strict).is_empty());
+    }
+
+    /// `plugins.custom` in the claims admits custom plugins on any plan, and
+    /// an enterprise licence issued before the flag joined its plan keeps them.
+    #[test]
+    fn custom_plugins_follow_the_flag_or_the_plan() {
+        use mcpg_control_plane_license::license::FEATURE_CUSTOM_PLUGINS;
+        let mut contracted = claims_for("team");
+        contracted.features.push(FEATURE_CUSTOM_PLUGINS.to_owned());
+        assert!(allows_custom_plugins(&contracted));
+        check_config_entitlements(CUSTOM_PLUGIN_CONFIG, &contracted)
+            .expect("a contracted plugins.custom grant");
+        let mut pinned = claims_for("enterprise");
+        pinned.features.retain(|f| f != FEATURE_CUSTOM_PLUGINS);
+        assert!(allows_custom_plugins(&pinned));
+        assert!(!allows_custom_plugins(&claims_for("team")));
+    }
+
+    /// `quotas.plugins` caps the entries one config lists, disabled ones
+    /// included; `0` is unlimited and unparseable input fails closed.
+    #[test]
+    fn plugin_count_is_capped_by_the_plan() {
+        let entries = |n: usize| {
+            let mut cfg = String::from("plugins:\n");
+            for i in 0..n {
+                cfg.push_str(&format!(
+                    "  - id: dev.mcpg.transform.t{i}\n    disabled: true\n    source:\n      \
+                     oci: ghcr.io/mcpg-dev/plugins/transform-t{i}:1.0.0\n"
+                ));
+            }
+            cfg
+        };
+        let community = claims_for("community");
+        assert_eq!(community.quotas.plugins, 25);
+        check_plugin_quota(&entries(25), &community).expect("at the quota");
+        check_plugin_quota("gateway: {}\n", &community).expect("no plugins");
+        let err = check_plugin_quota(&entries(26), &community).unwrap_err();
+        assert_eq!(
+            err.violations,
+            vec![Violation {
+                kind: "plugin_quota_exceeded",
+                snippet: "plugins lists 26 entries and plan `community` includes 25".to_owned(),
+            }]
+        );
+        check_plugin_quota(&entries(400), &claims_for("enterprise")).expect("unlimited");
+        assert_eq!(
+            check_plugin_quota("just a string", &community)
+                .unwrap_err()
+                .violations[0]
+                .kind,
+            "unparseable_config"
+        );
+    }
+
+    /// `event_types` caps the MCP Events types one config declares; `0` is
+    /// unlimited and unparseable input fails closed.
+    #[test]
+    fn declared_event_types_are_capped_by_the_plan() {
+        let types = |n: usize| {
+            let mut cfg = String::from("mcp:\n  capabilities:\n    events:\n");
+            for i in 0..n {
+                cfg.push_str(&format!(
+                    "      - name: orders.e{i}\n        source:\n          inbound:\n            \
+                     source_id: e{i}\n"
+                ));
+            }
+            cfg
+        };
+        let community = claims_for("community");
+        let limit = community.quotas.event_types_for("community");
+        assert_eq!(limit, 10);
+        check_event_type_quota(&types(10), &community).expect("at the cap");
+        check_event_type_quota("gateway: {}\n", &community).expect("no events");
+        let err = check_event_type_quota(&types(11), &community).unwrap_err();
+        assert_eq!(
+            err.violations,
+            vec![Violation {
+                kind: "event_type_quota_exceeded",
+                snippet: "mcp.capabilities.events declares 11 event types and plan `community` \
+                          serves 10"
+                    .to_owned(),
+            }]
+        );
+        check_event_type_quota(&types(400), &claims_for("enterprise")).expect("unlimited");
+        assert_eq!(
+            check_event_type_quota("just a string", &community)
+                .unwrap_err()
+                .violations[0]
+                .kind,
+            "unparseable_config"
+        );
     }
 
     const LOGIN_CONFIG: &str = r#"

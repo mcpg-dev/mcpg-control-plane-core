@@ -132,33 +132,65 @@ message ServerMessage {
     Quarantine quarantine = 4;
     DiagnosticRequest diagnostic_request = 5;
     LogRequest log_request = 6;
-    // E.3 — fast-path quota status push. Sent on threshold cross
-    // ("approaching exhaustion") + on rolling-window replenishment.
-    // Heartbeat responses also carry the same value as a baseline
-    // so a gateway that misses a push converges within ~30s.
+    // Quota status push, sent after every heartbeat. Heartbeat
+    // responses also carry the same value as a baseline so a gateway
+    // that misses a push converges within ~30s.
     QuotaStatus quota_status = 7;
+    // The org's licence, sent when the Channel opens and whenever it
+    // changes.
+    LicenseUpdate license_update = 8;
   }
 }
 
-// CP→gateway license-quota status. Tracks `tool_calls_per_month`
-// (rolling 30 days) on the org's license. Gateway uses this to
-// pre-dispatch refuse calls when exhausted, avoiding wasted
-// upstream tool execution. Pushed both as a `ServerMessage` fast
-// path (on threshold cross / replenishment) and as an optional
-// field on every `HeartbeatResponse` (baseline self-heal).
+// CP→gateway: the licence of the org this gateway is enrolled into. An
+// empty `license_jwt` means the org holds none, and the gateway runs the
+// community tier. The gateway verifies the token against the MCPG issuer
+// keys compiled into it; a cloud licence must also name `org_slug` as its
+// `tenant_slug`.
+//
+// The gateway opens the Channel with two metadata entries:
+// `mcpg-delivery-nonce`, a fresh random nonce for this Channel, and
+// `mcpg-agent-version`, the build version of the running binary.
+message LicenseUpdate {
+  string license_jwt = 1;
+  // The slug of the org the CP enrolled this gateway into.
+  string org_slug = 2;
+  // Proof that mcpg.cloud delivered this licence on this Channel: a JWT
+  // (`typ: mcpg-delivery+jwt`, `aud: mcpg-gateway-delivery`) the mcpg.cloud
+  // control plane signs with its `platform` issuer key over `org_slug`, the
+  // licence's digest, the Channel's `mcpg-delivery-nonce` and the instance
+  // uid the Channel is authenticated as
+  // (`mcpg_control_plane_license::delivery`). A gateway accepts a cloud
+  // licence only with a proof that verifies; without one the delivery is
+  // a customer control plane's, and the gateway's own `license:` block
+  // counts. Empty from a control plane that is not mcpg.cloud.
+  string delivery_proof = 3;
+  // The CP's refresh of this licence from the federation is failing, so
+  // the licence may expire before a renewed one arrives. The gateway warns
+  // about a cloud licence's expiry only while this is set or once the
+  // licence is past its `exp`.
+  bool refresh_failing = 4;
+}
+
+// CP→gateway tool-call quota status for the org's billing period,
+// the calendar month in UTC. Gateway uses this to pre-dispatch
+// refuse calls when exhausted, avoiding wasted upstream tool
+// execution. Pushed both as a `ServerMessage` fast path and as an
+// optional field on every `HeartbeatResponse` (baseline self-heal).
 message QuotaStatus {
-  // True when the org has consumed `tool_calls_per_month` and
-  // further dispatches must be refused gateway-side.
+  // True when the org has reached its serving ceiling for the
+  // period and further dispatches must be refused gateway-side.
   bool exhausted = 1;
-  // Best-effort rolling-window replenishment hint. Gateways MAY
-  // set HTTP `Retry-After` from this. May be unset when CP can't
-  // estimate (e.g. unmetered/unlimited tier).
+  // When the period ends and the count starts over: the first of
+  // the next month, 00:00 UTC. Gateways MAY set HTTP `Retry-After`
+  // from this. Unset when not exhausted.
   google.protobuf.Timestamp until = 2;
-  // Calls remaining in the current window. Zero on `exhausted:
-  // true`. Unset when the license is unlimited.
+  // Calls remaining before the serving ceiling. Zero on
+  // `exhausted: true`. Unset when there is no ceiling.
   optional uint64 remaining = 3;
-  // Window cap (the license `tool_calls_per_month`). Unset when
-  // unlimited. Operator UI uses this for the "X / Y used" bar.
+  // The serving ceiling: the included allowance, plus prepaid pack
+  // credits and the pay-as-you-go calls the org's spend cap allows
+  // on a paid plan. Unset when there is no ceiling.
   optional uint64 limit = 4;
 
   // Per-gateway requests-per-second ceiling from the license
@@ -167,6 +199,47 @@ message QuotaStatus {
   // letting a loop burn a month's allowance in minutes. Unset when
   // the license does not cap it.
   optional uint32 rps_limit = 5;
+
+  // The included allowance for the period, the part of `limit` the
+  // plan itself carries. Unset when unlimited.
+  optional uint64 included = 6;
+
+  // MCP Events: the plan's cap on live event readers
+  // (`event_subscriptions`), on each gateway: webhook subscriptions, poll
+  // leases and open streams, plus the upstream subscriptions the gateway
+  // holds for imported event types. A gateway refuses a new reader at it.
+  // Unset when there is none.
+  optional uint64 event_subscriptions_limit = 7;
+  // MCP Events: true when the org has reached its delivery hold point
+  // for the period. That is the allowance (`events_delivered_per_month`)
+  // on the free plan, or when the billing service gave no current
+  // answer; on a paid plan it is the allowance plus what the spend cap
+  // buys. Gateways hold deliveries in every mode until `events_until`;
+  // held events wait in the log within its retention.
+  bool events_exhausted = 8;
+  // When the events period ends: the first of the next month, 00:00 UTC.
+  // Unset when neither events allowance is used.
+  google.protobuf.Timestamp events_until = 9;
+  // MCP Events: true when the org has taken in its events for the period
+  // (`events_ingested_per_month`). Gateways hold every event source until
+  // `events_until`: a pull source stops and later resumes from its
+  // position, and an inbound or upstream webhook answers 429 with
+  // `Retry-After`.
+  bool events_ingest_exhausted = 10;
+  // MCP Events: the plan's cap on the event types one gateway serves,
+  // declared and imported (`event_types`). Unset when there is none.
+  optional uint64 event_types_limit = 11;
+  // MCP Events: the plan's caps on what one event log keeps
+  // (`event_retention_ms`, `event_retention_events`,
+  // `event_retention_bytes`). A gateway keeps the smaller of the type's
+  // configured retention and these. Unset when there is none.
+  optional uint64 event_retention_ms_limit = 12;
+  optional uint64 event_retention_events_limit = 13;
+  optional uint64 event_retention_bytes_limit = 14;
+  // MCP Events: the plan's cap on the webhook retry window
+  // (`event_retry_window_ms`). A gateway retries a delivery for the
+  // smaller of the configured window and this. Unset when there is none.
+  optional uint64 event_retry_window_ms_limit = 15;
 }
 
 message Heartbeat {
@@ -195,6 +268,23 @@ message StatusReport {
   // "pending" without either side sending a value. Empty when the gateway
   // has no secrets directory or it holds no key.
   string secrets_digest = 7;
+  // Set while the last licence delivery this gateway took on its Channel
+  // carries a cloud licence the gateway counts for nothing, for want of a
+  // delivery proof that verifies. Every report repeats it until a delivery
+  // the gateway counts replaces it. Unset otherwise, and on agents that
+  // predate the field.
+  DeliveryRefusal delivery_refusal = 8;
+}
+
+// Why a gateway counts a delivered cloud licence for nothing. Carries no
+// licence.
+message DeliveryRefusal {
+  // "no_proof": the delivery carried no proof; "proof_refused": its proof
+  // did not verify.
+  string reason = 1;
+  // The `kid` the refused proof's header names, read without verifying it;
+  // empty for "no_proof".
+  string proof_kid = 2;
 }
 
 // Coordinator health as the reporting replica sees it. A
@@ -298,10 +388,11 @@ message ConfigAck {
 }
 
 // Per-call tool invocation samples batched by the gateway and
-// shipped to the CP for storage + rollup. Cadence:
-// every 30-60s, capped at ~500 samples per message to bound
-// wire size; a bounded ring buffer on the gateway drops oldest
-// when the cap is hit (overflow counted in `dropped_overflow`).
+// shipped to the CP for storage + rollup. Cadence: every 30 s the
+// gateway ships its whole buffer, capped at ~500 samples per
+// message to bound wire size; a bounded ring buffer on the gateway
+// drops samples when it fills between flushes (counted in
+// `dropped_overflow` and `dropped_non_billable`).
 //
 // Privacy invariant: tool *names* and aggregate stats only.
 // Tool *arguments* and *responses* are NEVER shipped — they may
@@ -311,10 +402,39 @@ message MetricsReport {
   google.protobuf.Timestamp at = 1;
   uint64 seq = 2;
   repeated ToolInvocationSample invocations = 3;
-  // Number of samples dropped at the source because the gateway's
-  // in-memory ring buffer overflowed. Surfaces "we ran hot" to
-  // the operator without distorting the stored time-series.
+  // Billable samples (outcomes that count toward usage) dropped at
+  // the source because the gateway's ring buffer overflowed. The
+  // calls happened, so the CP folds this count into the billable
+  // ledger.
   uint64 dropped_overflow = 4;
+  // Non-billable samples (policy-denied, quota-refused, replayed)
+  // dropped on overflow. The buffer evicts these first. Reported
+  // for visibility only; never billed.
+  uint64 dropped_non_billable = 5;
+  // MCP Events deliveries and ingests since the previous report, rolled
+  // up per event type and mode. No principal, URL or host.
+  repeated EventUsageSample events = 6;
+}
+
+message EventUsageSample {
+  string event_name = 1;
+  // The delivery mode of delivered and abandoned events (`webhook`,
+  // `poll` or `push`), or the source kind of ingested ones (`watch`,
+  // `resource`, `inbound` or `federation`; builtin types are not metered).
+  string mode = 2;
+  // Billable events delivered: acknowledged by a receiver (a retry counts
+  // once), returned by a poll, or sent on a stream. A type whose source is
+  // `builtin` is delivered but counts 0 here; its bytes still count.
+  uint64 delivered = 3;
+  // Events given up.
+  uint64 abandoned = 4;
+  // Bytes of the delivered bodies, or of the ingested occurrences.
+  uint64 bytes = 5;
+  google.protobuf.Timestamp window_start = 6;
+  google.protobuf.Timestamp window_end = 7;
+  // Occurrences taken into the event log. An occurrence the log already
+  // holds counts nothing.
+  uint64 ingested = 8;
 }
 
 message ToolInvocationSample {
