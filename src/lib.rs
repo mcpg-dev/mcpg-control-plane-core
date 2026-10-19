@@ -20,6 +20,7 @@ pub use mcpg_control_plane_license::license;
 pub mod migrations;
 pub mod model;
 pub mod plan_notice;
+pub mod plugin_layout;
 pub mod provider;
 pub mod publish_guard;
 pub mod ratelimit;

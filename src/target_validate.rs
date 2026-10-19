@@ -48,6 +48,10 @@ pub struct GatewayCapabilities {
     #[serde(default)]
     pub gateway_version: String,
     pub plugin_protocol_version: String,
+    /// The ABI layout fingerprint of the build; empty on releases that do
+    /// not report one.
+    #[serde(default)]
+    pub plugin_abi_layout: String,
     pub config_schema: serde_json::Value,
     #[serde(default)]
     pub baked_plugins: Vec<BakedPlugin>,
@@ -224,6 +228,22 @@ enum PluginSource {
     Path(String),
 }
 
+/// Every `plugins[].source.oci` of a YAML or TOML config, with its index;
+/// empty for a config that does not parse.
+pub fn oci_plugin_sources(raw: &str) -> Vec<(usize, String)> {
+    parse_structured(raw)
+        .map(|value| {
+            plugin_entries(&value)
+                .into_iter()
+                .filter_map(|(idx, source)| match source {
+                    PluginSource::Oci(reference) => Some((idx, reference)),
+                    PluginSource::Path(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every `plugins[].source` in the parsed config, with its index.
 fn plugin_entries(value: &serde_json::Value) -> Vec<(usize, PluginSource)> {
     let mut out = Vec::new();
@@ -266,6 +286,7 @@ mod tests {
             manifest_version: 1,
             gateway_version: "0.1.0-beta.23".into(),
             plugin_protocol_version: "1.0".into(),
+            plugin_abi_layout: String::new(),
             config_schema: schema,
             baked_plugins: vec![BakedPlugin {
                 id: "dev.mcpg.backend.http".into(),
